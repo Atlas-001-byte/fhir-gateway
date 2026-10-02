@@ -1,0 +1,312 @@
+#!/usr/bin/env python3
+"""FHIR Gateway: 资源校验、术语映射与审计留痕（一次完成）。
+
+用法:
+    fhir-gateway --audit-file PATH < request.json
+
+仅使用 Python 标准库，从零实现，不依赖任何外部 FHIR/术语库。
+成功: stdout 一行 JSON；审计记录追加到 --audit-file (JSON Lines)。
+失败: stdout 为空；stderr 一行 {"error": {...}}；退出码 2。
+"""
+
+import json
+import os
+import sys
+import uuid
+
+ALLOWED_RESOURCE_TYPES = ("Patient", "Observation", "Condition")
+
+# FHIR R4 Observation.status
+# http://hl7.org/fhir/R4/valueset-observation-status.html
+OBSERVATION_STATUSES = (
+    "registered",
+    "preliminary",
+    "final",
+    "amended",
+    "cancelled",
+    "corrected",
+    "entered-in-error",
+    "unknown",
+)
+
+
+class GatewayError(Exception):
+    """所有受控错误的基类，type 取具体异常类名。"""
+
+
+class InputError(GatewayError):
+    """JSON、请求结构或 audit_context 非法。"""
+
+
+class FhirValidationError(GatewayError):
+    """FHIR 资源非法。"""
+
+
+class TermMappingError(GatewayError):
+    """术语映射项非法，或同一源编码存在多个目标。"""
+
+
+class AuditWriteError(GatewayError):
+    """审计文件缺失参数、路径非法、无权限或追加不完整。"""
+
+
+def _is_nonempty_str(value):
+    return isinstance(value, str) and value != ""
+
+
+def _find_codings(node, out):
+    """收集资源内所有含非空 system/code 的编码对象（Coding 形态）。"""
+    if isinstance(node, dict):
+        system = node.get("system")
+        code = node.get("code")
+        if _is_nonempty_str(system) and _is_nonempty_str(code):
+            out.append({"system": system, "code": code})
+        for value in node.values():
+            _find_codings(value, out)
+    elif isinstance(node, list):
+        for item in node:
+            _find_codings(item, out)
+
+
+def _primary_coding(codeable_concept, label):
+    """校验 CodeableConcept，返回其首个含非空 system/code 的 coding。"""
+    if not isinstance(codeable_concept, dict):
+        raise FhirValidationError("%s 必须为 CodeableConcept 对象" % label)
+    codings = codeable_concept.get("coding")
+    if not isinstance(codings, list) or codings == []:
+        raise FhirValidationError("%s.coding 必须为非空数组" % label)
+    coding = codings[0]
+    if not isinstance(coding, dict):
+        raise FhirValidationError("%s.coding[0] 必须为对象" % label)
+    if not _is_nonempty_str(coding.get("system")):
+        raise FhirValidationError("%s 含非空 system" % label)
+    if not _is_nonempty_str(coding.get("code")):
+        raise FhirValidationError("%s 含非空 code" % label)
+    return coding
+
+
+def validate_resource(resource):
+    """按任务约定校验 Patient / Observation / Condition。"""
+    if not isinstance(resource, dict):
+        raise FhirValidationError("resource 必须为对象")
+
+    resource_type = resource.get("resourceType")
+    if resource_type not in ALLOWED_RESOURCE_TYPES:
+        raise FhirValidationError(
+            "resource.resourceType 仅限 %s" % "、".join(ALLOWED_RESOURCE_TYPES)
+        )
+
+    if not _is_nonempty_str(resource.get("id")):
+        raise FhirValidationError("resource.id 必须为非空字符串")
+
+    if resource_type == "Observation":
+        if resource.get("status") not in OBSERVATION_STATUSES:
+            raise FhirValidationError(
+                "Observation.status 不符合 FHIR R4 ObservationStatus"
+            )
+        _primary_coding(resource.get("code"), "Observation.code")
+
+    if resource_type == "Condition":
+        _primary_coding(resource.get("clinicalStatus"), "Condition.clinicalStatus")
+
+
+def validate_audit_context(audit_context):
+    if not isinstance(audit_context, dict):
+        raise InputError("audit_context 必须为对象")
+    for field in ("request_id", "actor", "recorded_at"):
+        if not _is_nonempty_str(audit_context.get(field)):
+            raise InputError("audit_context.%s 必须为非空字符串" % field)
+
+
+def build_term_index(term_maps):
+    """term_maps -> {(system, code): (target_system, target_code)}。"""
+    if not isinstance(term_maps, list):
+        raise InputError("term_maps 必须为数组")
+
+    index = {}
+    for pos, item in enumerate(term_maps):
+        label = "term_maps[%d]" % pos
+        if not isinstance(item, dict):
+            raise TermMappingError("%s 必须为对象" % label)
+        for field in ("system", "code", "target_system", "target_code"):
+            if not _is_nonempty_str(item.get(field)):
+                raise TermMappingError("%s.%s 必须为非空字符串" % (label, field))
+
+        key = (item["system"], item["code"])
+        target = (item["target_system"], item["target_code"])
+        if key in index and index[key] != target:
+            raise TermMappingError(
+                "同一源编码 %s 存在多个映射目标" % json.dumps(
+                    {"system": key[0], "code": key[1]}, ensure_ascii=False
+                )
+            )
+        index[key] = target
+    return index
+
+
+def apply_mappings(resource, index):
+    """为资源内每个 system/code 对象生成映射结果；资源本身不改写。"""
+    codings = []
+    _find_codings(resource, codings)
+
+    mappings = []
+    for coding in codings:
+        target = index.get((coding["system"], coding["code"]))
+        mappings.append(
+            {
+                "source": {"system": coding["system"], "code": coding["code"]},
+                "status": "mapped" if target is not None else "unmapped",
+                "target": (
+                    None
+                    if target is None
+                    else {"system": target[0], "code": target[1]}
+                ),
+            }
+        )
+    return mappings
+
+
+def append_audit_line(path, audit):
+    """将审计 JSON 追加为 JSON Lines 的一行，保留已有行。"""
+    line = json.dumps(audit, ensure_ascii=False) + "\n"
+    payload = line.encode("utf-8")
+
+    # 已有文件若缺少结尾换行，先补一个分隔符，避免与上一行粘连（不改动旧行内容）。
+    prefix = b""
+    try:
+        with open(path, "rb") as existing:
+            existing.seek(-1, os.SEEK_END)
+            if existing.read(1) != b"\n":
+                prefix = b"\n"
+    except FileNotFoundError:
+        prefix = b""
+    except OSError:
+        prefix = b""
+
+    data = prefix + payload
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    except OSError as exc:
+        raise AuditWriteError("无法打开审计文件 %s: %s" % (path, exc.strerror or exc))
+
+    written = 0
+    try:
+        while written < len(data):
+            n = os.write(fd, data[written:])
+            if n <= 0:
+                raise AuditWriteError("审计文件追加不完整: %s" % path)
+            written += n
+        os.fsync(fd)
+    except OSError as exc:
+        raise AuditWriteError("审计文件追加失败 %s: %s" % (path, exc.strerror or exc))
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+    if written != len(data):
+        raise AuditWriteError("审计文件追加不完整: %s" % path)
+
+
+def parse_args(argv):
+    audit_path = None
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg in ("-h", "--help"):
+            sys.stdout.write(__doc__)
+            sys.exit(0)
+        elif arg == "--audit-file":
+            if i + 1 >= len(argv):
+                raise AuditWriteError("--audit-file 缺少文件路径参数")
+            audit_path = argv[i + 1]
+            i += 2
+        elif arg.startswith("--audit-file="):
+            audit_path = arg[len("--audit-file=") :]
+            if audit_path == "":
+                raise AuditWriteError("--audit-file 缺少文件路径参数")
+            i += 1
+        else:
+            raise AuditWriteError("未知参数: %s" % arg)
+
+    if audit_path is None:
+        raise AuditWriteError("缺少必需参数 --audit-file")
+    return audit_path
+
+
+def process(raw_text, audit_path):
+    try:
+        request = json.loads(raw_text)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise InputError("请求不是合法 JSON: %s" % exc)
+
+    if not isinstance(request, dict):
+        raise InputError("请求必须为 JSON 对象")
+
+    for field in ("resource", "term_maps", "audit_context"):
+        if field not in request:
+            raise InputError("请求缺少字段: %s" % field)
+
+    resource = request["resource"]
+    term_maps = request["term_maps"]
+    audit_context = request["audit_context"]
+
+    validate_audit_context(audit_context)
+    validate_resource(resource)
+    index = build_term_index(term_maps)
+    mappings = apply_mappings(resource, index)
+
+    audit = {
+        "request_id": audit_context["request_id"],
+        "actor": audit_context["actor"],
+        "recorded_at": audit_context["recorded_at"],
+        "decision": "accepted",
+        "audit_id": uuid.uuid4().hex,
+    }
+
+    # 先落审计，再输出 stdout，保证审计失败时 stdout 一定为空。
+    append_audit_line(audit_path, audit)
+
+    result = {
+        "status": "accepted",
+        "resource_type": resource["resourceType"],
+        "resource": resource,
+        "mappings": mappings,
+        "audit": audit,
+    }
+    return json.dumps(result, ensure_ascii=False)
+
+
+def main(argv):
+    try:
+        audit_path = parse_args(argv)
+    except GatewayError as exc:
+        _emit_error(exc)
+        return 2
+
+    try:
+        raw_text = sys.stdin.read()
+    except OSError as exc:
+        _emit_error(InputError("读取标准输入失败: %s" % exc))
+        return 2
+
+    try:
+        output = process(raw_text, audit_path)
+    except GatewayError as exc:
+        _emit_error(exc)
+        return 2
+
+    sys.stdout.write(output + "\n")
+    sys.stdout.flush()
+    return 0
+
+
+def _emit_error(exc):
+    payload = {"error": {"type": type(exc).__name__, "message": str(exc) or "error"}}
+    sys.stderr.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    sys.stderr.flush()
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

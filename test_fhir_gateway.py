@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """fhir-gateway 端到端测试（标准库 unittest，通过子进程调用）。"""
 
+import hashlib
 import json
 import os
 import subprocess
@@ -10,6 +11,8 @@ import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 GATEWAY = os.path.join(HERE, "fhir-gateway")
+
+GENESIS_DIGEST = "0" * 64
 
 
 def run(payload, audit_file=None, args=None, raw=None):
@@ -23,6 +26,48 @@ def run(payload, audit_file=None, args=None, raw=None):
         cmd, input=stdin, capture_output=True, text=True, timeout=30
     )
     return proc
+
+
+def run_chain(payload, audit_file, raw=None):
+    return run(payload, audit_file, args=["--audit-chain"], raw=raw)
+
+
+def run_verify(audit_file, stdin_text=""):
+    cmd = [
+        sys.executable,
+        GATEWAY,
+        "--verify-audit",
+        "--audit-file",
+        audit_file,
+    ]
+    return subprocess.run(
+        cmd, input=stdin_text, capture_output=True, text=True, timeout=30
+    )
+
+
+def canonical(obj):
+    return json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def digest_of(prev_digest, record_without_digest):
+    material = prev_digest + "\n" + canonical(record_without_digest)
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def write_chain_lines(path, records, trailing_newline=True):
+    """按链式规则构造审计文件；records 不含 audit_digest。"""
+    prev_digest = GENESIS_DIGEST
+    lines = []
+    for record in records:
+        digest = digest_of(prev_digest, record)
+        lines.append(json.dumps(dict(record, audit_digest=digest), ensure_ascii=False))
+        prev_digest = digest
+    text = "\n".join(lines)
+    if lines and trailing_newline:
+        text += "\n"
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(text)
+
 
 
 def base_request(**overrides):
@@ -919,6 +964,378 @@ class ErrorTests(unittest.TestCase):
             nested = os.path.join(tmp, "missing-dir", "audit.jsonl")
             proc = run(base_request(), nested)
             self.assert_error(proc, "AuditWriteError", nested, False)
+
+
+class AuditChainWriteTests(unittest.TestCase):
+    def assert_write_error(self, proc):
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(proc.stdout, "")
+        err = json.loads(proc.stderr)
+        self.assertEqual(err["error"]["type"], "AuditWriteError")
+        self.assertTrue(err["error"]["message"])
+
+    def assert_independent_chain(self, audit_file, expected_count):
+        with open(audit_file, encoding="utf-8") as fh:
+            raw_lines = [line for line in fh.read().splitlines() if line]
+        self.assertEqual(len(raw_lines), expected_count)
+        prev_digest = GENESIS_DIGEST
+        last_id = None
+        for raw_line in raw_lines:
+            record = json.loads(raw_line)
+            digest = record.pop("audit_digest")
+            self.assertRegex(digest, r"^[0-9a-f]{64}$")
+            self.assertEqual(digest, digest_of(prev_digest, record))
+            prev_digest = digest
+            last_id = record["audit_id"]
+        return prev_digest, last_id
+
+    def test_chain_single_resource_fields_and_genesis_digest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            proc = run_chain(base_request(), audit_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            audit = json.loads(proc.stdout)["audit"]
+            self.assertEqual(
+                set(audit),
+                {
+                    "request_id",
+                    "actor",
+                    "recorded_at",
+                    "decision",
+                    "audit_id",
+                    "audit_digest",
+                },
+            )
+            self.assertRegex(audit["audit_digest"], r"^[0-9a-f]{64}$")
+            body = {k: v for k, v in audit.items() if k != "audit_digest"}
+            self.assertEqual(
+                audit["audit_digest"], digest_of(GENESIS_DIGEST, body)
+            )
+            # stdout 与落盘一致；资源正文与映射原文不入审计。
+            with open(audit_file, encoding="utf-8") as fh:
+                self.assertEqual(json.loads(fh.readline()), audit)
+            raw = open(audit_file, encoding="utf-8").read()
+            self.assertNotIn("obs-1", raw)
+            self.assertNotIn("loinc", raw)
+
+    def test_chain_multiple_submissions_linked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            for _ in range(3):
+                proc = run_chain(base_request(), audit_file)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+            last_digest, last_id = self.assert_independent_chain(audit_file, 3)
+            proc = run_verify(audit_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            report = json.loads(proc.stdout)
+            self.assertEqual(report["status"], "valid")
+            self.assertEqual(report["line_count"], 3)
+            self.assertEqual(report["last_audit_id"], last_id)
+            self.assertEqual(report["last_audit_digest"], last_digest)
+
+    def test_chain_non_ascii_and_canonical_ordering(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            req = base_request()
+            req["audit_context"]["actor"] = "李医生"
+            req["audit_context"]["request_id"] = "请求-甲"
+            proc = run_chain(req, audit_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            # 独立按 UTF-8 + 键序 + 无空格规范 JSON 复算。
+            self.assert_independent_chain(audit_file, 1)
+            with open(audit_file, "rb") as fh:
+                line = fh.readline().rstrip(b"\n")
+            record = json.loads(line.decode("utf-8"))
+            self.assertIn("李医生", line.decode("utf-8"))
+            digest = record.pop("audit_digest")
+            expected = digest_of(GENESIS_DIGEST, record)
+            self.assertEqual(digest, expected)
+
+    def test_chain_creates_missing_file_and_accepts_empty_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = os.path.join(tmp, "new.jsonl")
+            self.assertFalse(os.path.exists(missing))
+            proc = run_chain(base_request(), missing)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertTrue(os.path.exists(missing))
+
+            empty = os.path.join(tmp, "empty.jsonl")
+            open(empty, "w").close()
+            proc = run_chain(base_request(), empty)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assert_independent_chain(empty, 1)
+
+    def test_chain_rejects_plain_jsonl_without_appending(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            with open(audit_file, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps({"prior": True}) + "\n")
+            proc = run_chain(base_request(), audit_file)
+            self.assert_write_error(proc)
+            with open(audit_file, encoding="utf-8") as fh:
+                lines = fh.read().splitlines()
+            self.assertEqual(lines, [json.dumps({"prior": True})])
+
+    def test_chain_rejects_tampered_digest_without_appending(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            record = {
+                "request_id": "req-1",
+                "actor": "dr-house",
+                "recorded_at": "2026-10-03T10:00:00Z",
+                "decision": "accepted",
+                "audit_id": "fixed-id-1",
+            }
+            write_chain_lines(audit_file, [record])
+            # 改写正文但不重算摘要 → 断链。
+            tampered = dict(record, request_id="tampered")
+            with open(audit_file, "w", encoding="utf-8") as fh:
+                fh.write(
+                    json.dumps(
+                        dict(tampered, audit_digest=GENESIS_DIGEST[:-1] + "1"),
+                        ensure_ascii=False,
+                    )
+                    + "\n"
+                )
+            proc = run_chain(base_request(), audit_file)
+            self.assert_write_error(proc)
+            with open(audit_file, encoding="utf-8") as fh:
+                self.assertEqual(len(fh.read().splitlines()), 1)
+
+    def test_chain_rejects_duplicate_audit_id_without_appending(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            base = {
+                "request_id": "req-1",
+                "actor": "dr-house",
+                "recorded_at": "2026-10-03T10:00:00Z",
+                "decision": "accepted",
+                "audit_id": "dup-id",
+            }
+            second = dict(base, request_id="req-2")
+            write_chain_lines(audit_file, [base, second])
+            proc = run_chain(base_request(), audit_file)
+            self.assert_write_error(proc)
+            with open(audit_file, encoding="utf-8") as fh:
+                self.assertEqual(len(fh.read().splitlines()), 2)
+
+    def test_chain_rejects_line_missing_audit_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            record = {"decision": "accepted", "audit_digest": GENESIS_DIGEST}
+            with open(audit_file, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(record) + "\n")
+            proc = run_chain(base_request(), audit_file)
+            self.assert_write_error(proc)
+            err = json.loads(proc.stderr)
+            self.assertIn("audit_id", err["error"]["message"])
+
+    def test_chain_parent_directory_missing_is_write_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            nested = os.path.join(tmp, "missing-dir", "audit.jsonl")
+            proc = run_chain(base_request(), nested)
+            self.assert_write_error(proc)
+
+    def test_chain_appends_after_valid_chain_without_trailing_newline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            record = {
+                "request_id": "req-1",
+                "actor": "dr-house",
+                "recorded_at": "2026-10-03T10:00:00Z",
+                "decision": "accepted",
+                "audit_id": "fixed-id-1",
+            }
+            write_chain_lines(audit_file, [record], trailing_newline=False)
+            proc = run_chain(base_request(), audit_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assert_independent_chain(audit_file, 2)
+
+    def test_chain_executable_bundle_keeps_summary_and_adds_digest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            entries = [
+                tx_entry(patient_resource("pat-1")),
+                tx_entry(patient_resource("pat-2"), method="DELETE"),
+            ]
+            req = executable_request(entries, bundle_type="batch")
+            proc = run_chain(req, audit_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            audit = json.loads(proc.stdout)["audit"]
+            self.assertEqual(audit["bundle_type"], "batch")
+            self.assertEqual(audit["status"], 200)
+            self.assertEqual(audit["entry_total"], 2)
+            self.assertEqual(audit["entry_succeeded"], 1)
+            self.assertEqual(audit["entry_failed"], 1)
+            self.assertRegex(audit["audit_digest"], r"^[0-9a-f]{64}$")
+            body = {k: v for k, v in audit.items() if k != "audit_digest"}
+            self.assertEqual(audit["audit_digest"], digest_of(GENESIS_DIGEST, body))
+            with open(audit_file, encoding="utf-8") as fh:
+                self.assertEqual(json.loads(fh.readline()), audit)
+
+    def test_plain_mode_has_no_digest_and_keeps_arbitrary_lines(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            with open(audit_file, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps({"prior": True}) + "\n")
+            proc = run(base_request(), audit_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            audit = json.loads(proc.stdout)["audit"]
+            self.assertNotIn("audit_digest", audit)
+            with open(audit_file, encoding="utf-8") as fh:
+                lines = [json.loads(line) for line in fh if line.strip()]
+            self.assertEqual(lines[0], {"prior": True})
+            self.assertEqual(lines[1], audit)
+
+
+class VerifyAuditTests(unittest.TestCase):
+    def assert_verify_error(self, proc, expected_type):
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(proc.stdout, "")
+        err = json.loads(proc.stderr)
+        self.assertEqual(err["error"]["type"], expected_type)
+        self.assertTrue(err["error"]["message"])
+
+    def _record(self, audit_id, **extra):
+        record = {
+            "request_id": "req-" + audit_id,
+            "actor": "dr-house",
+            "recorded_at": "2026-10-03T10:00:00Z",
+            "decision": "accepted",
+            "audit_id": audit_id,
+        }
+        record.update(extra)
+        return record
+
+    def test_verify_valid_chain_report_fields_in_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            records = [self._record("id-1"), self._record("id-2")]
+            write_chain_lines(audit_file, records)
+            proc = run_verify(audit_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stderr, "")
+            keys = json.loads(proc.stdout).keys()
+            self.assertEqual(
+                list(keys),
+                ["status", "line_count", "last_audit_id", "last_audit_digest"],
+            )
+            report = json.loads(proc.stdout)
+            self.assertEqual(report["status"], "valid")
+            self.assertEqual(report["line_count"], 2)
+            self.assertEqual(report["last_audit_id"], "id-2")
+            # 末摘要等于第二行独立复算值。
+            prev = digest_of(GENESIS_DIGEST, records[0])
+            self.assertEqual(report["last_audit_digest"], digest_of(prev, records[1]))
+
+    def test_verify_empty_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "empty.jsonl")
+            open(audit_file, "w").close()
+            proc = run_verify(audit_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(
+                json.loads(proc.stdout),
+                {
+                    "status": "valid",
+                    "line_count": 0,
+                    "last_audit_id": None,
+                    "last_audit_digest": None,
+                },
+            )
+
+    def test_verify_does_not_read_stdin(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            write_chain_lines(audit_file, [self._record("id-1")])
+            proc = run_verify(audit_file, stdin_text="{not json garbage")
+            self.assertEqual(proc.returncode, 0)
+            self.assertEqual(json.loads(proc.stdout)["status"], "valid")
+
+    def test_verify_missing_file_is_read_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = run_verify(os.path.join(tmp, "nope.jsonl"))
+            self.assert_verify_error(proc, "AuditReadError")
+
+    def test_verify_directory_is_read_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = run_verify(tmp)
+            self.assert_verify_error(proc, "AuditReadError")
+
+    def test_verify_missing_parent_is_read_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = run_verify(os.path.join(tmp, "no-dir", "a.jsonl"))
+            self.assert_verify_error(proc, "AuditReadError")
+
+    def test_verify_invalid_json_is_verification_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            with open(audit_file, "w", encoding="utf-8") as fh:
+                fh.write("{not json\n")
+            proc = run_verify(audit_file)
+            self.assert_verify_error(proc, "AuditVerificationError")
+
+    def test_verify_non_object_line_is_verification_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            with open(audit_file, "w", encoding="utf-8") as fh:
+                fh.write("[1, 2, 3]\n")
+            proc = run_verify(audit_file)
+            self.assert_verify_error(proc, "AuditVerificationError")
+
+    def test_verify_missing_digest_is_verification_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            with open(audit_file, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(self._record("id-1")) + "\n")
+            proc = run_verify(audit_file)
+            self.assert_verify_error(proc, "AuditVerificationError")
+
+    def test_verify_malformed_digest_is_verification_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for bad in ("ABC" + "0" * 61, "0" * 63, "0" * 65, "x" * 64, ""):
+                audit_file = os.path.join(tmp, "audit-%s.jsonl" % len(bad))
+                with open(audit_file, "w", encoding="utf-8") as fh:
+                    fh.write(
+                        json.dumps(self._record("id-1", audit_digest=bad)) + "\n"
+                    )
+                proc = run_verify(audit_file)
+                self.assert_verify_error(proc, "AuditVerificationError")
+
+    def test_verify_empty_audit_id_is_verification_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            record = self._record("")
+            record["audit_digest"] = GENESIS_DIGEST
+            with open(audit_file, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(record) + "\n")
+            proc = run_verify(audit_file)
+            self.assert_verify_error(proc, "AuditVerificationError")
+
+    def test_verify_duplicate_audit_id_is_verification_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            write_chain_lines(
+                audit_file, [self._record("dup"), self._record("dup")]
+            )
+            proc = run_verify(audit_file)
+            self.assert_verify_error(proc, "AuditVerificationError")
+
+    def test_verify_broken_chain_is_verification_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            write_chain_lines(
+                audit_file, [self._record("id-1"), self._record("id-2")]
+            )
+            lines = open(audit_file, encoding="utf-8").read().splitlines()
+            second = json.loads(lines[1])
+            # 保持 audit_digest 不变，仅改正文 → 第二行摘要失配。
+            second["actor"] = "someone-else"
+            with open(audit_file, "w", encoding="utf-8") as fh:
+                fh.write(lines[0] + "\n" + json.dumps(second, ensure_ascii=False) + "\n")
+            proc = run_verify(audit_file)
+            self.assert_verify_error(proc, "AuditVerificationError")
+            self.assertIn("2", json.loads(proc.stderr)["error"]["message"])
 
 
 if __name__ == "__main__":

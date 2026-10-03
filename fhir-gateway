@@ -3,6 +3,8 @@
 
 用法:
     fhir-gateway --audit-file PATH < request.json
+    fhir-gateway --audit-chain --audit-file PATH < request.json
+    fhir-gateway --verify-audit --audit-file PATH
 
 仅使用 Python 标准库，从零实现，不依赖任何外部 FHIR/术语库。
 支持单个 Patient/Observation/Condition，或 FHIR R4 Bundle（含若干 entry 资源）。
@@ -10,10 +12,22 @@ type 为 transaction/batch 的 Bundle 走批量执行语义：按 entry 顺序�
 术语映射（不写业务资源库），输出 transaction-response/batch-response Bundle。
 成功: stdout 一行 JSON；审计记录追加到 --audit-file (JSON Lines)，每次提交一条。
 失败: stdout 为空；stderr 一行 {"error": {...}}；退出码 2。
+
+--audit-chain 开启审计完整性链：每条审计增加 audit_digest（SHA-256，64 位
+小写十六进制），按 UTF-8 对上一条 audit_digest、换行和本条移除该字段后的
+规范 JSON 计算，首条前序摘要为 64 个 0；规范 JSON 的对象键按 Unicode 码点
+升序、分隔符后无空格、非 ASCII 原样保留。链式追加仅接受文件不存在、为空或
+全行均可验证的链式审计。
+
+--verify-audit 只校验链式文件（不读取标准输入）：从首行到末行检查结构、
+audit_id 唯一性与摘要连续性；成功时 stdout 输出一行
+{"status": "valid", "line_count": N, "last_audit_id": ..., "last_audit_digest": ...}。
 """
 
+import hashlib
 import json
 import os
+import re
 import sys
 import uuid
 
@@ -52,6 +66,11 @@ OBSERVATION_STATUSES = (
     "unknown",
 )
 
+# 完整性链常量：摘要字段名、算法、首条前序摘要（64 个 0）。
+DIGEST_FIELD = "audit_digest"
+GENESIS_DIGEST = "0" * 64
+DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+
 
 class GatewayError(Exception):
     """所有受控错误的基类，type 取具体异常类名。"""
@@ -70,7 +89,16 @@ class TermMappingError(GatewayError):
 
 
 class AuditWriteError(GatewayError):
-    """审计文件缺失参数、路径非法、无权限或追加不完整。"""
+    """审计文件缺失参数、路径非法、无权限、追加不完整或链式校验失败。"""
+
+
+class AuditVerificationError(GatewayError):
+    """链式审计结构、audit_id 唯一性或摘要连续性校验失败。"""
+
+
+class AuditReadError(GatewayError):
+    """链式审计文件缺失、路径为目录、父目录不存在或读取失败。"""
+
 
 
 def _is_nonempty_str(value):
@@ -329,7 +357,7 @@ def execute_bundle_entry(pos, entry, term_index, term_index_error):
     }
 
 
-def process_executable_bundle(bundle, term_maps, audit_context, audit_path):
+def process_executable_bundle(bundle, term_maps, audit_context, audit_path, chain=False):
     """transaction/batch：按 entry 顺序逐项校验与映射，汇总为响应 Bundle。"""
     if not _is_nonempty_str(bundle.get("id")):
         raise FhirValidationError("Bundle.id 必须为非空字符串")
@@ -379,7 +407,7 @@ def process_executable_bundle(bundle, term_maps, audit_context, audit_path):
     }
 
     # 先落审计，再输出 stdout，保证审计失败时 stdout 一定为空。
-    append_audit_line(audit_path, audit)
+    audit = append_audit_line(audit_path, audit, chain)
 
     result = {
         "status": overall_status,
@@ -390,8 +418,129 @@ def process_executable_bundle(bundle, term_maps, audit_context, audit_path):
     return json.dumps(result, ensure_ascii=False)
 
 
-def append_audit_line(path, audit):
-    """将审计 JSON 追加为 JSON Lines 的一行，保留已有行。"""
+def canonical_json(obj):
+    """规范 JSON：对象键按 Unicode 码点升序，分隔符后无空格，非 ASCII 原样。"""
+    return json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def compute_digest(prev_digest, audit_without_digest):
+    """对上一条摘要、换行与本条规范 JSON（UTF-8）计算 SHA-256。"""
+    material = prev_digest + "\n" + canonical_json(audit_without_digest)
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def _is_hex64(value):
+    return isinstance(value, str) and DIGEST_RE.match(value) is not None
+
+
+def _chain_line_error(pos, message):
+    return "第 %d 行: %s" % (pos + 1, message)
+
+
+def validate_chain_lines(raw_text):
+    """逐行校验链式审计，返回 (条数, 末条 audit_id, 末条 audit_digest)。
+
+    空文件（无任何非空行）返回 (0, None, None)。
+    结构、audit_id 唯一性、摘要连续性任一不满足抛 AuditVerificationError。
+    """
+    seen_ids = set()
+    prev_digest = GENESIS_DIGEST
+    count = 0
+    last_audit_id = None
+    last_digest = None
+
+    for pos, raw_line in enumerate(raw_text.splitlines()):
+        if raw_line.strip() == "":
+            raise AuditVerificationError(_chain_line_error(pos, "存在空行"))
+        try:
+            record = json.loads(raw_line)
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise AuditVerificationError(
+                _chain_line_error(pos, "JSON 解析失败: %s" % exc)
+            )
+        if not isinstance(record, dict):
+            raise AuditVerificationError(_chain_line_error(pos, "行非 JSON 对象"))
+
+        digest = record.get(DIGEST_FIELD)
+        if not _is_hex64(digest):
+            raise AuditVerificationError(
+                _chain_line_error(pos, "audit_digest 缺失或格式错误")
+            )
+        audit_id = record.get("audit_id")
+        if not _is_nonempty_str(audit_id):
+            raise AuditVerificationError(
+                _chain_line_error(pos, "audit_id 缺失或为空")
+            )
+        if audit_id in seen_ids:
+            raise AuditVerificationError(
+                _chain_line_error(pos, "audit_id 重复: %s" % audit_id)
+            )
+
+        body = dict(record)
+        del body[DIGEST_FIELD]
+        expected = compute_digest(prev_digest, body)
+        if digest != expected:
+            raise AuditVerificationError(
+                _chain_line_error(pos, "摘要不匹配，审计链断裂")
+            )
+
+        seen_ids.add(audit_id)
+        prev_digest = digest
+        count += 1
+        last_audit_id = audit_id
+        last_digest = digest
+
+    return count, last_audit_id, last_digest
+
+
+def read_chain_file(path):
+    """读取链式审计文件文本；文件/目录/父目录/读取问题统一为 AuditReadError。"""
+    parent = os.path.dirname(os.path.abspath(path))
+    if not os.path.isdir(parent):
+        raise AuditReadError("审计文件父目录不存在: %s" % parent)
+    if os.path.isdir(path):
+        raise AuditReadError("审计路径是目录: %s" % path)
+    if not os.path.exists(path):
+        raise AuditReadError("审计文件不存在: %s" % path)
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read()
+    except OSError as exc:
+        raise AuditReadError("读取审计文件失败 %s: %s" % (path, exc.strerror or exc))
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise AuditReadError("审计文件不是合法 UTF-8: %s" % exc)
+
+
+def append_audit_line(path, audit, chain=False):
+    """将审计 JSON 追加为 JSON Lines 的一行，保留已有行。
+
+    chain=True 时写入前先全量校验既有链式审计，并为新条目计算 audit_digest；
+    校验失败抛 AuditWriteError，且不追加本条。普通模式可读取任意已有 JSON Lines。
+    """
+    if chain:
+        # 校验通过后才计算摘要：既有行非链式/断链/重复 ID/缺字段/不可读时，
+        # 本条绝不追加；写入路径统一以 AuditWriteError 上报（verify 模式才
+        # 区分 AuditVerificationError / AuditReadError）。
+        try:
+            if os.path.exists(path):
+                _, _, last_digest = validate_chain_lines(read_chain_file(path))
+                prev_digest = (
+                    last_digest if last_digest is not None else GENESIS_DIGEST
+                )
+            else:
+                parent = os.path.dirname(os.path.abspath(path))
+                if not os.path.isdir(parent):
+                    raise AuditWriteError("审计文件父目录不存在: %s" % parent)
+                prev_digest = GENESIS_DIGEST
+        except AuditWriteError:
+            raise
+        except (AuditReadError, AuditVerificationError) as exc:
+            raise AuditWriteError(str(exc))
+        audit = dict(audit)
+        audit[DIGEST_FIELD] = compute_digest(prev_digest, audit)
+
     line = json.dumps(audit, ensure_ascii=False) + "\n"
     payload = line.encode("utf-8")
 
@@ -432,9 +581,13 @@ def append_audit_line(path, audit):
     if written != len(data):
         raise AuditWriteError("审计文件追加不完整: %s" % path)
 
+    return audit
+
 
 def parse_args(argv):
     audit_path = None
+    chain = False
+    verify = False
     i = 0
     while i < len(argv):
         arg = argv[i]
@@ -451,15 +604,23 @@ def parse_args(argv):
             if audit_path == "":
                 raise AuditWriteError("--audit-file 缺少文件路径参数")
             i += 1
+        elif arg == "--audit-chain":
+            chain = True
+            i += 1
+        elif arg == "--verify-audit":
+            verify = True
+            i += 1
         else:
             raise AuditWriteError("未知参数: %s" % arg)
 
     if audit_path is None:
+        if verify:
+            raise AuditReadError("--verify-audit 需要配合 --audit-file PATH")
         raise AuditWriteError("缺少必需参数 --audit-file")
-    return audit_path
+    return audit_path, chain, verify
 
 
-def process(raw_text, audit_path):
+def process(raw_text, audit_path, chain=False):
     try:
         request = json.loads(raw_text)
     except (json.JSONDecodeError, ValueError) as exc:
@@ -481,7 +642,9 @@ def process(raw_text, audit_path):
     is_bundle = isinstance(resource, dict) and resource.get("resourceType") == "Bundle"
     if is_bundle and resource.get("type") in EXECUTABLE_BUNDLE_TYPES:
         # transaction/batch：批量执行语义，entry 问题进入响应而非网关级错误。
-        return process_executable_bundle(resource, term_maps, audit_context, audit_path)
+        return process_executable_bundle(
+            resource, term_maps, audit_context, audit_path, chain
+        )
     if is_bundle:
         # 顺序：Bundle 自身 → 各 entry.resource（均在 term_maps 校验之前）。
         validate_bundle(resource)
@@ -503,7 +666,7 @@ def process(raw_text, audit_path):
     }
 
     # 先落审计，再输出 stdout，保证审计失败时 stdout 一定为空。
-    append_audit_line(audit_path, audit)
+    audit = append_audit_line(audit_path, audit, chain)
 
     result = {
         "status": "accepted",
@@ -515,12 +678,37 @@ def process(raw_text, audit_path):
     return json.dumps(result, ensure_ascii=False)
 
 
+def verify_audit_file(path):
+    """只校验链式文件：结构、audit_id 唯一性与摘要连续性；不读取标准输入。"""
+    raw_text = read_chain_file(path)
+    line_count, last_audit_id, last_digest = validate_chain_lines(raw_text)
+    return {
+        "status": "valid",
+        "line_count": line_count,
+        "last_audit_id": last_audit_id,
+        "last_audit_digest": last_digest,
+    }
+
+
 def main(argv):
     try:
-        audit_path = parse_args(argv)
+        audit_path, chain, verify = parse_args(argv)
     except GatewayError as exc:
         _emit_error(exc)
         return 2
+
+    if verify:
+        # 校验模式不读取标准输入。
+        try:
+            report = verify_audit_file(audit_path)
+        except GatewayError as exc:
+            _emit_error(exc)
+            return 2
+        sys.stdout.write(
+            json.dumps(report, ensure_ascii=False, separators=(",", ":")) + "\n"
+        )
+        sys.stdout.flush()
+        return 0
 
     try:
         raw_text = sys.stdin.read()
@@ -529,7 +717,7 @@ def main(argv):
         return 2
 
     try:
-        output = process(raw_text, audit_path)
+        output = process(raw_text, audit_path, chain)
     except GatewayError as exc:
         _emit_error(exc)
         return 2

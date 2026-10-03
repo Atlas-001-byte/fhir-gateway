@@ -5,7 +5,8 @@
     fhir-gateway --audit-file PATH < request.json
 
 仅使用 Python 标准库，从零实现，不依赖任何外部 FHIR/术语库。
-成功: stdout 一行 JSON；审计记录追加到 --audit-file (JSON Lines)。
+支持单个 Patient/Observation/Condition，或 FHIR R4 Bundle（含若干 entry 资源）。
+成功: stdout 一行 JSON；审计记录追加到 --audit-file (JSON Lines)，每个 Bundle 一条。
 失败: stdout 为空；stderr 一行 {"error": {...}}；退出码 2。
 """
 
@@ -15,6 +16,20 @@ import sys
 import uuid
 
 ALLOWED_RESOURCE_TYPES = ("Patient", "Observation", "Condition")
+
+# FHIR R4 Bundle.type
+# http://hl7.org/fhir/R4/valueset-bundle-type.html
+BUNDLE_TYPES = (
+    "document",
+    "message",
+    "transaction",
+    "transaction-response",
+    "batch",
+    "batch-response",
+    "history",
+    "searchset",
+    "collection",
+)
 
 # FHIR R4 Observation.status
 # http://hl7.org/fhir/R4/valueset-observation-status.html
@@ -110,6 +125,36 @@ def validate_resource(resource):
         _primary_coding(resource.get("clinicalStatus"), "Condition.clinicalStatus")
 
 
+def validate_bundle(bundle):
+    """校验 FHIR R4 Bundle：非空 id、合法 type，entry 内资源逐项校验。"""
+    if not isinstance(bundle, dict):
+        raise FhirValidationError("resource 必须为对象")
+
+    if bundle.get("resourceType") != "Bundle":
+        raise FhirValidationError("resource.resourceType 必须为 Bundle")
+
+    if not _is_nonempty_str(bundle.get("id")):
+        raise FhirValidationError("Bundle.id 必须为非空字符串")
+
+    if bundle.get("type") not in BUNDLE_TYPES:
+        raise FhirValidationError(
+            "Bundle.type 仅限 %s" % "、".join(BUNDLE_TYPES)
+        )
+
+    if "entry" in bundle:
+        entries = bundle["entry"]
+        if not isinstance(entries, list):
+            raise FhirValidationError("Bundle.entry 必须为数组")
+        for pos, entry in enumerate(entries):
+            label = "Bundle.entry[%d]" % pos
+            if not isinstance(entry, dict):
+                raise FhirValidationError("%s 必须为对象" % label)
+            if "resource" not in entry:
+                raise FhirValidationError("%s 缺少 resource" % label)
+            # entry 内复用同一套 Patient/Observation/Condition 校验。
+            validate_resource(entry["resource"])
+
+
 def validate_audit_context(audit_context):
     if not isinstance(audit_context, dict):
         raise InputError("audit_context 必须为对象")
@@ -163,6 +208,15 @@ def apply_mappings(resource, index):
                 ),
             }
         )
+    return mappings
+
+
+def apply_bundle_mappings(bundle, index):
+    """按 entry 顺序、资源内嵌套顺序收集编码；entry 缺失/空则无映射。"""
+    mappings = []
+    entries = bundle.get("entry") or []
+    for entry in entries:
+        mappings.extend(apply_mappings(entry["resource"], index))
     return mappings
 
 
@@ -253,9 +307,19 @@ def process(raw_text, audit_path):
     audit_context = request["audit_context"]
 
     validate_audit_context(audit_context)
-    validate_resource(resource)
+
+    is_bundle = isinstance(resource, dict) and resource.get("resourceType") == "Bundle"
+    if is_bundle:
+        # 顺序：Bundle 自身 → 各 entry.resource（均在 term_maps 校验之前）。
+        validate_bundle(resource)
+    else:
+        validate_resource(resource)
     index = build_term_index(term_maps)
-    mappings = apply_mappings(resource, index)
+    mappings = (
+        apply_bundle_mappings(resource, index)
+        if is_bundle
+        else apply_mappings(resource, index)
+    )
 
     audit = {
         "request_id": audit_context["request_id"],

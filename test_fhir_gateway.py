@@ -210,6 +210,295 @@ class SuccessTests(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stderr)
 
 
+def bundle_request(entries=None, bundle_id="bundle-1", bundle_type="transaction", **overrides):
+    bundle = {"resourceType": "Bundle", "id": bundle_id, "type": bundle_type}
+    if entries is not None:
+        bundle["entry"] = entries
+    req = base_request(resource=bundle, term_maps=[])
+    req.update(overrides)
+    return req
+
+
+def patient_entry(pid="pat-1"):
+    return {"resource": {"resourceType": "Patient", "id": pid}}
+
+
+def observation_entry(oid="obs-1", status="final", system="http://loinc.org", code="8867-4"):
+    return {
+        "resource": {
+            "resourceType": "Observation",
+            "id": oid,
+            "status": status,
+            "code": {"coding": [{"system": system, "code": code}]},
+        }
+    }
+
+
+def condition_entry(cid="cond-1", code="active"):
+    return {
+        "resource": {
+            "resourceType": "Condition",
+            "id": cid,
+            "clinicalStatus": {
+                "coding": [
+                    {
+                        "system": "http://terminology.hl7.org/CodeSystem/condition-clinical",
+                        "code": code,
+                    }
+                ]
+            },
+        }
+    }
+
+
+class BundleSuccessTests(unittest.TestCase):
+    def test_bundle_accepted_with_entries_in_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            req = bundle_request(
+                [patient_entry(), observation_entry(), condition_entry()]
+            )
+            req["term_maps"] = [
+                {
+                    "system": "http://loinc.org",
+                    "code": "8867-4",
+                    "target_system": "http://snomed.info/sct",
+                    "target_code": "8499000",
+                }
+            ]
+            proc = run(req, audit_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stderr, "")
+
+            out = json.loads(proc.stdout)
+            self.assertEqual(
+                list(out.keys()),
+                ["status", "resource_type", "resource", "mappings", "audit"],
+            )
+            self.assertEqual(out["status"], "accepted")
+            self.assertEqual(out["resource_type"], "Bundle")
+            self.assertEqual(out["resource"], req["resource"])
+            self.assertEqual(len(out["mappings"]), 2)
+            self.assertEqual(out["mappings"][0]["status"], "mapped")
+            self.assertEqual(
+                out["mappings"][0]["target"],
+                {"system": "http://snomed.info/sct", "code": "8499000"},
+            )
+            self.assertEqual(out["mappings"][1]["status"], "unmapped")
+            self.assertIsNone(out["mappings"][1]["target"])
+
+            audit = out["audit"]
+            self.assertEqual(audit["decision"], "accepted")
+            self.assertTrue(audit["audit_id"])
+            self.assertNotIn("resource", audit)
+            self.assertNotIn("mappings", audit)
+            with open(audit_file, encoding="utf-8") as fh:
+                lines = [json.loads(line) for line in fh if line.strip()]
+            self.assertEqual(len(lines), 1)
+            self.assertEqual(lines[0], audit)
+
+    def test_bundle_without_or_empty_entry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            for bundle in (
+                bundle_request(),
+                bundle_request(entries=[]),
+            ):
+                proc = run(bundle, audit_file)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                out = json.loads(proc.stdout)
+                self.assertEqual(out["resource_type"], "Bundle")
+                self.assertEqual(out["mappings"], [])
+            with open(audit_file, encoding="utf-8") as fh:
+                lines = fh.readlines()
+            self.assertEqual(len(lines), 2)
+
+    def test_bundle_all_types_allowed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            for btype in (
+                "document",
+                "message",
+                "transaction",
+                "transaction-response",
+                "batch",
+                "batch-response",
+                "history",
+                "searchset",
+                "collection",
+            ):
+                proc = run(bundle_request(bundle_type=btype), audit_file)
+                self.assertEqual(proc.returncode, 0, (btype, proc.stderr))
+
+    def test_bundle_mapping_order_and_duplicates_not_merged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            entries = [
+                observation_entry("obs-1", code="8867-4"),
+                observation_entry("obs-2", code="29463-7"),
+                observation_entry("obs-3", code="8867-4"),
+            ]
+            req = bundle_request(entries)
+            req["term_maps"] = [
+                {
+                    "system": "http://loinc.org",
+                    "code": "8867-4",
+                    "target_system": "http://snomed.info/sct",
+                    "target_code": "8499000",
+                }
+            ]
+            proc = run(req, audit_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            mappings = json.loads(proc.stdout)["mappings"]
+            self.assertEqual(
+                [(m["source"]["code"], m["status"]) for m in mappings],
+                [
+                    ("8867-4", "mapped"),
+                    ("29463-7", "unmapped"),
+                    ("8867-4", "mapped"),
+                ],
+            )
+
+    def test_bundle_unknown_fields_preserved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            req = bundle_request(
+                [
+                    {
+                        "fullUrl": "urn:uuid:abc",
+                        "resource": {
+                            "resourceType": "Patient",
+                            "id": "pat-1",
+                            "extra": {"nested": [1, 2]},
+                        },
+                    }
+                ]
+            )
+            req["resource"]["link"] = [{"relation": "self"}]
+            proc = run(req, audit_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            out = json.loads(proc.stdout)
+            self.assertEqual(out["resource"], req["resource"])
+
+
+class BundleErrorTests(unittest.TestCase):
+    def assert_error(self, proc, expected_type, audit_file=None, file_exists=None):
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(proc.stdout, "")
+        err = json.loads(proc.stderr)
+        self.assertEqual(err["error"]["type"], expected_type)
+        self.assertTrue(err["error"]["message"])
+        if file_exists is not None:
+            self.assertEqual(os.path.exists(audit_file), file_exists)
+
+    def test_bundle_missing_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            req = bundle_request([patient_entry()], bundle_id=None)
+            del req["resource"]["id"]
+            proc = run(req, audit_file)
+            self.assert_error(proc, "FhirValidationError", audit_file, False)
+
+    def test_bundle_empty_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            proc = run(bundle_request([patient_entry()], bundle_id=""), audit_file)
+            self.assert_error(proc, "FhirValidationError", audit_file, False)
+
+    def test_bundle_bad_type(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            proc = run(
+                bundle_request([patient_entry()], bundle_type="bogus"),
+                audit_file,
+            )
+            self.assert_error(proc, "FhirValidationError", audit_file, False)
+
+    def test_bundle_entry_not_object(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            proc = run(bundle_request([1]), audit_file)
+            self.assert_error(proc, "FhirValidationError", audit_file, False)
+
+    def test_bundle_entry_missing_resource(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            proc = run(bundle_request([{"fullUrl": "urn:uuid:x"}]), audit_file)
+            self.assert_error(proc, "FhirValidationError", audit_file, False)
+
+    def test_bundle_entry_bad_resource_type(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            req = bundle_request(
+                [patient_entry(), {"resource": {"resourceType": "Medication", "id": "m"}}]
+            )
+            proc = run(req, audit_file)
+            self.assert_error(proc, "FhirValidationError", audit_file, False)
+
+    def test_bundle_entry_resource_missing_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            req = bundle_request(
+                [patient_entry(), {"resource": {"resourceType": "Patient"}}]
+            )
+            proc = run(req, audit_file)
+            self.assert_error(proc, "FhirValidationError", audit_file, False)
+
+    def test_bundle_entry_observation_bad_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            req = bundle_request(
+                [patient_entry(), observation_entry(status="draft")]
+            )
+            proc = run(req, audit_file)
+            self.assert_error(proc, "FhirValidationError", audit_file, False)
+
+    def test_bundle_entry_not_array(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            req = bundle_request()
+            req["resource"]["entry"] = {"resource": {"resourceType": "Patient", "id": "p"}}
+            proc = run(req, audit_file)
+            self.assert_error(proc, "FhirValidationError", audit_file, False)
+
+    def test_bundle_term_map_invalid(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            req = bundle_request([observation_entry()])
+            req["term_maps"] = [
+                {"system": "http://loinc.org", "code": "8867-4", "target_system": ""}
+            ]
+            proc = run(req, audit_file)
+            self.assert_error(proc, "TermMappingError", audit_file, False)
+
+    def test_bundle_term_map_conflict(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            req = bundle_request([observation_entry()])
+            req["term_maps"] = [
+                {
+                    "system": "http://loinc.org",
+                    "code": "8867-4",
+                    "target_system": "http://snomed.info/sct",
+                    "target_code": "8499000",
+                },
+                {
+                    "system": "http://loinc.org",
+                    "code": "8867-4",
+                    "target_system": "http://snomed.info/sct",
+                    "target_code": "9999999",
+                },
+            ]
+            proc = run(req, audit_file)
+            self.assert_error(proc, "TermMappingError", audit_file, False)
+
+    def test_bundle_audit_unwritable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            nested = os.path.join(tmp, "missing-dir", "audit.jsonl")
+            proc = run(bundle_request([patient_entry()]), nested)
+            self.assert_error(proc, "AuditWriteError", nested, False)
+
+
 class ErrorTests(unittest.TestCase):
     def assert_error(self, proc, expected_type, audit_file=None, file_exists=None):
         self.assertEqual(proc.returncode, 2)

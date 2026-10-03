@@ -210,7 +210,7 @@ class SuccessTests(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stderr)
 
 
-def bundle_request(entries=None, bundle_id="bundle-1", bundle_type="transaction", **overrides):
+def bundle_request(entries=None, bundle_id="bundle-1", bundle_type="collection", **overrides):
     bundle = {"resourceType": "Bundle", "id": bundle_id, "type": bundle_type}
     if entries is not None:
         bundle["entry"] = entries
@@ -497,6 +497,305 @@ class BundleErrorTests(unittest.TestCase):
             nested = os.path.join(tmp, "missing-dir", "audit.jsonl")
             proc = run(bundle_request([patient_entry()]), nested)
             self.assert_error(proc, "AuditWriteError", nested, False)
+
+
+def tx_entry(resource, method="POST", url=None):
+    if url is None:
+        url = "%s/%s" % (resource.get("resourceType"), resource.get("id", "x"))
+    return {"request": {"method": method, "url": url}, "resource": resource}
+
+
+def patient_resource(pid="pat-1"):
+    return {"resourceType": "Patient", "id": pid}
+
+
+def observation_resource(oid="obs-1", status="final"):
+    return {
+        "resourceType": "Observation",
+        "id": oid,
+        "status": status,
+        "code": {"coding": [{"system": "http://loinc.org", "code": "8867-4"}]},
+    }
+
+
+def executable_request(entries, bundle_type="transaction", **overrides):
+    req = bundle_request(entries, bundle_type=bundle_type)
+    req.update(overrides)
+    return req
+
+
+class ExecutableBundleTests(unittest.TestCase):
+    def test_transaction_all_ok(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            entries = [
+                tx_entry(patient_resource("pat-1")),
+                tx_entry(observation_resource("obs-1")),
+            ]
+            proc = run(executable_request(entries), audit_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stderr, "")
+
+            out = json.loads(proc.stdout)
+            self.assertEqual(list(out.keys()), ["status", "resource_type", "resource", "audit"])
+            self.assertEqual(out["status"], 200)
+            self.assertEqual(out["resource_type"], "Bundle")
+
+            bundle = out["resource"]
+            self.assertEqual(bundle["resourceType"], "Bundle")
+            self.assertEqual(bundle["type"], "transaction-response")
+            self.assertEqual(len(bundle["entry"]), 2)
+            self.assertEqual(
+                [(e["resourceType"], e["status"]) for e in bundle["entry"]],
+                [("Patient", 200), ("Observation", 200)],
+            )
+            for entry in bundle["entry"]:
+                self.assertNotIn("outcome", entry)
+
+            audit = out["audit"]
+            self.assertEqual(audit["request_id"], "req-1")
+            self.assertEqual(audit["bundle_type"], "transaction")
+            self.assertEqual(audit["entry_total"], 2)
+            self.assertEqual(audit["entry_succeeded"], 2)
+            self.assertEqual(audit["entry_failed"], 0)
+            self.assertEqual(audit["status"], 200)
+            self.assertTrue(audit["audit_id"])
+            self.assertEqual(
+                audit["entries"],
+                [
+                    {
+                        "index": 0,
+                        "resource_type": "Patient",
+                        "phase": "completed",
+                        "status": 200,
+                        "issue_code": None,
+                    },
+                    {
+                        "index": 1,
+                        "resource_type": "Observation",
+                        "phase": "completed",
+                        "status": 200,
+                        "issue_code": None,
+                    },
+                ],
+            )
+
+            with open(audit_file, encoding="utf-8") as fh:
+                raw = fh.read()
+            lines = [json.loads(line) for line in raw.splitlines() if line.strip()]
+            self.assertEqual(len(lines), 1)
+            self.assertEqual(lines[0], audit)
+            # 审计不含资源正文、标识或术语映射原文。
+            self.assertNotIn("pat-1", raw)
+            self.assertNotIn("loinc", raw)
+
+    def test_transaction_missing_request_is_invalid(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            entries = [
+                tx_entry(patient_resource("pat-1")),
+                {"resource": patient_resource("pat-2")},
+            ]
+            proc = run(executable_request(entries), audit_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+            out = json.loads(proc.stdout)
+            self.assertEqual(out["status"], 400)
+            entry = out["resource"]["entry"][1]
+            self.assertEqual(entry["status"], 400)
+            issue = entry["outcome"]["issue"][0]
+            self.assertEqual(issue["code"], "invalid")
+            self.assertEqual(issue["entry"], 1)
+            self.assertEqual(issue["expression"], "Bundle.entry[1].request")
+            self.assertEqual(out["resource"]["entry"][0]["status"], 200)
+
+            audit = out["audit"]
+            self.assertEqual(audit["entry_failed"], 1)
+            self.assertEqual(audit["entry_succeeded"], 1)
+            self.assertEqual(audit["status"], 400)
+            self.assertEqual(audit["entries"][1]["phase"], "request")
+            self.assertEqual(audit["entries"][1]["issue_code"], "invalid")
+
+    def test_transaction_missing_resource_is_invalid(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            entries = [{"request": {"method": "POST", "url": "Patient/pat-1"}}]
+            proc = run(executable_request(entries), audit_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            out = json.loads(proc.stdout)
+            self.assertEqual(out["status"], 400)
+            entry = out["resource"]["entry"][0]
+            self.assertIsNone(entry["resourceType"])
+            issue = entry["outcome"]["issue"][0]
+            self.assertEqual(issue["code"], "invalid")
+            self.assertEqual(issue["expression"], "Bundle.entry[0].resource")
+
+    def test_transaction_url_type_mismatch_is_invalid(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            entries = [tx_entry(patient_resource("pat-1"), url="Observation/pat-1")]
+            proc = run(executable_request(entries), audit_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            out = json.loads(proc.stdout)
+            self.assertEqual(out["status"], 400)
+            issue = out["resource"]["entry"][0]["outcome"]["issue"][0]
+            self.assertEqual(issue["code"], "invalid")
+            self.assertEqual(issue["expression"], "Bundle.entry[0].request.url")
+
+    def test_transaction_method_not_supported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            entries = [tx_entry(patient_resource(), method="DELETE")]
+            proc = run(executable_request(entries), audit_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            out = json.loads(proc.stdout)
+            self.assertEqual(out["status"], 400)
+            issue = out["resource"]["entry"][0]["outcome"]["issue"][0]
+            self.assertEqual(issue["code"], "not-supported")
+            self.assertEqual(issue["expression"], "Bundle.entry[0].request.method")
+
+    def test_transaction_validation_failure_is_processing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            entries = [tx_entry(observation_resource(status="draft"))]
+            proc = run(executable_request(entries), audit_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            out = json.loads(proc.stdout)
+            self.assertEqual(out["status"], 400)
+            issue = out["resource"]["entry"][0]["outcome"]["issue"][0]
+            self.assertEqual(issue["code"], "processing")
+            self.assertEqual(out["audit"]["entries"][0]["phase"], "validation")
+
+    def test_transaction_mapping_failure_is_processing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            req = executable_request([tx_entry(observation_resource())])
+            req["term_maps"] = [
+                {
+                    "system": "http://loinc.org",
+                    "code": "8867-4",
+                    "target_system": "http://snomed.info/sct",
+                    "target_code": "8499000",
+                },
+                {
+                    "system": "http://loinc.org",
+                    "code": "8867-4",
+                    "target_system": "http://snomed.info/sct",
+                    "target_code": "9999999",
+                },
+            ]
+            proc = run(req, audit_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            out = json.loads(proc.stdout)
+            self.assertEqual(out["status"], 400)
+            issue = out["resource"]["entry"][0]["outcome"]["issue"][0]
+            self.assertEqual(issue["code"], "processing")
+            self.assertEqual(out["audit"]["entries"][0]["phase"], "mapping")
+
+    def test_transaction_all_or_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            entries = [
+                tx_entry(patient_resource("pat-1")),
+                tx_entry(patient_resource("pat-2"), method="DELETE"),
+                tx_entry(patient_resource("pat-3")),
+            ]
+            proc = run(executable_request(entries), audit_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            out = json.loads(proc.stdout)
+            # 任一失败整体 400，不返回部分成功的整体状态。
+            self.assertEqual(out["status"], 400)
+            self.assertEqual(
+                [e["status"] for e in out["resource"]["entry"]], [200, 400, 200]
+            )
+            self.assertEqual(out["audit"]["status"], 400)
+            self.assertEqual(out["audit"]["entry_failed"], 1)
+
+    def test_batch_independent_and_duplicates_in_place(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            entries = [
+                tx_entry(patient_resource("pat-1")),
+                tx_entry(patient_resource("pat-2"), method="DELETE"),
+                tx_entry(patient_resource("pat-1")),
+            ]
+            proc = run(executable_request(entries, bundle_type="batch"), audit_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            out = json.loads(proc.stdout)
+            # batch 各项独立：失败项 400，其余继续，整体 200。
+            self.assertEqual(out["status"], 200)
+            self.assertEqual(out["resource"]["type"], "batch-response")
+            self.assertEqual(
+                [e["status"] for e in out["resource"]["entry"]], [200, 400, 200]
+            )
+            issue = out["resource"]["entry"][1]["outcome"]["issue"][0]
+            self.assertEqual(issue["code"], "not-supported")
+            self.assertEqual(issue["entry"], 1)
+
+            audit = out["audit"]
+            self.assertEqual(audit["bundle_type"], "batch")
+            self.assertEqual(audit["status"], 200)
+            self.assertEqual(audit["entry_total"], 3)
+            self.assertEqual(audit["entry_succeeded"], 2)
+            self.assertEqual(audit["entry_failed"], 1)
+            self.assertEqual(
+                [e["status"] for e in audit["entries"]], [200, 400, 200]
+            )
+
+    def test_transaction_empty_entries_ok(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            proc = run(executable_request([]), audit_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            out = json.loads(proc.stdout)
+            self.assertEqual(out["status"], 200)
+            self.assertEqual(out["resource"]["entry"], [])
+            self.assertEqual(out["audit"]["entry_total"], 0)
+
+    def test_repeat_submission_independent_audit_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            req = executable_request([tx_entry(patient_resource())])
+            for _ in range(2):
+                proc = run(req, audit_file)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+            with open(audit_file, encoding="utf-8") as fh:
+                lines = [json.loads(line) for line in fh if line.strip()]
+            self.assertEqual(len(lines), 2)
+            self.assertNotEqual(lines[0]["audit_id"], lines[1]["audit_id"])
+
+    def test_executable_audit_write_failure_empty_stdout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            nested = os.path.join(tmp, "missing-dir", "audit.jsonl")
+            req = executable_request([tx_entry(patient_resource())])
+            proc = run(req, nested)
+            self.assertEqual(proc.returncode, 2)
+            self.assertEqual(proc.stdout, "")
+            err = json.loads(proc.stderr)
+            self.assertEqual(err["error"]["type"], "AuditWriteError")
+
+    def test_executable_bundle_missing_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            req = executable_request([tx_entry(patient_resource())])
+            del req["resource"]["id"]
+            proc = run(req, audit_file)
+            self.assertEqual(proc.returncode, 2)
+            self.assertEqual(proc.stdout, "")
+            err = json.loads(proc.stderr)
+            self.assertEqual(err["error"]["type"], "FhirValidationError")
+            self.assertFalse(os.path.exists(audit_file))
+
+    def test_executable_term_maps_not_array_is_input_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            req = executable_request([tx_entry(patient_resource())], term_maps={})
+            proc = run(req, audit_file)
+            self.assertEqual(proc.returncode, 2)
+            self.assertEqual(proc.stdout, "")
+            err = json.loads(proc.stderr)
+            self.assertEqual(err["error"]["type"], "InputError")
+            self.assertFalse(os.path.exists(audit_file))
 
 
 class ErrorTests(unittest.TestCase):

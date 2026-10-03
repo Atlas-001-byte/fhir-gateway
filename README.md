@@ -50,7 +50,7 @@ FHIR R4 Bundle（请求契约不变，仅 `resource` 换成 Bundle）：
   "resource": {
     "resourceType": "Bundle",
     "id": "bundle-1",
-    "type": "transaction",
+    "type": "collection",
     "entry": [
       { "resource": { "resourceType": "Patient", "id": "pat-1" } },
       { "resource": { "resourceType": "Observation", "id": "obs-1", "...": "..." } }
@@ -58,6 +58,30 @@ FHIR R4 Bundle（请求契约不变，仅 `resource` 换成 Bundle）：
   },
   "term_maps": [],
   "audit_context": { "request_id": "req-2", "actor": "dr-house", "recorded_at": "..." }
+}
+```
+
+`type` 为 `transaction` / `batch` 的 Bundle 走批量执行语义，每个 entry 需带 `request`：
+
+```json
+{
+  "resource": {
+    "resourceType": "Bundle",
+    "id": "bundle-2",
+    "type": "transaction",
+    "entry": [
+      {
+        "request": { "method": "POST", "url": "Patient/pat-1" },
+        "resource": { "resourceType": "Patient", "id": "pat-1" }
+      },
+      {
+        "request": { "method": "PUT", "url": "Observation/obs-1" },
+        "resource": { "resourceType": "Observation", "id": "obs-1", "...": "..." }
+      }
+    ]
+  },
+  "term_maps": [],
+  "audit_context": { "request_id": "req-3", "actor": "dr-house", "recorded_at": "..." }
 }
 ```
 
@@ -69,10 +93,13 @@ FHIR R4 Bundle（请求契约不变，仅 `resource` 换成 Bundle）：
 - 单资源 `resource.resourceType` 仅限 `Patient`、`Observation`、`Condition`，且 `id` 为非空字符串。
 - `Observation.status` 必须符合 FHIR R4 ObservationStatus（`registered`、`preliminary`、`final`、`amended`、`cancelled`、`corrected`、`entered-in-error`、`unknown`）。
 - `Observation.code` 与 `Condition.clinicalStatus` 的首个 `coding` 必须含非空 `system`、`code`。
-- Bundle 规则：
+- Bundle 规则（`type` 非 `transaction`/`batch` 时）：
   - `resourceType` 为 `Bundle`，`id` 为非空字符串。
   - `type` 仅限 `document`、`message`、`transaction`、`transaction-response`、`batch`、`batch-response`、`history`、`searchset`、`collection`。
   - `entry` 可省略或为空数组；非空时必须为对象数组，每项含 `resource`，其中资源沿用上面的单资源校验；未知字段原样保留。
+- `transaction`/`batch` Bundle 规则（批量执行语义）：
+  - Bundle 级：`id` 非空、`type` 合法、`entry`（如有）为数组；不满足仍按 `FhirValidationError` 整体报错。
+  - entry 级（逐项判定，结果写入响应与审计，不作为整体异常）：每项必须为对象且含 `request`（对象）与 `resource`；`request.method` 仅支持 `POST`、`PUT`；`request.url` 首段（`/` 分隔）必须等于 `resource.resourceType`；随后对该资源执行既有校验与术语映射。不写业务资源库。
 - `term_maps` 每项 `system`、`code`、`target_system`、`target_code` 必须为非空字符串。
 - 同一源编码（`system` + `code`）映射到多个不同目标时报错；重复但目标相同允许。
 
@@ -109,7 +136,55 @@ FHIR R4 Bundle（请求契约不变，仅 `resource` 换成 Bundle）：
 
 - 资源内所有含非空 `system`/`code` 的编码对象（含嵌套结构）逐项生成映射结果；命中给目标，未命中 `status=unmapped` 且 `target=null`。Bundle 按 `entry` 顺序、每个资源按嵌套顺序收集，重复编码逐项列出、不合并。
 - `resource` 原样返回，绝不改写；Bundle 成功时 `resource_type` 为 `Bundle`。
-- 审计行（不含 `resource`、`mappings`）随后追加到 `--audit-file`，一行一条 JSON；每个 Bundle 仅追加一条审计。
+- 审计行（不含 `resource`、`mappings`）随后追加到 `--audit-file`，一行一条 JSON；每次提交仅追加一条审计。
+
+## transaction / batch 批量执行输出
+
+`type` 为 `transaction` / `batch` 的 Bundle 提交后，退出码为 `0`，stdout 一行 JSON，外层字段顺序仍为 `status`、`resource_type`、`resource`、`mappings`、`audit`，但：
+
+- `status` 为整体状态码（整数）：`transaction` 全有或全无——任一 entry 失败整体 `400`（不返回部分成功），全部通过才 `200`；`batch` 各项独立，失败项不影响其余，整体恒 `200`。
+- `resource` 为响应 Bundle：`type` 为 `transaction-response` / `batch-response`，`entry` 顺序与输入一致（重复 entry 按原位置逐项处理），每项含 `index`（从 0 开始）、`resourceType`、`status`（`200`/`400`）；失败项附 `outcome`（OperationOutcome）。
+- OperationOutcome 的 `issue` 含 `severity`（`error`）、`code`、`entryIndex`（从 0 开始的 entry 索引）、`expression`（字段表达式，如 `Bundle.entry[1].request.url`）与 `diagnostics`。`code` 取值：
+  - `invalid`：entry 缺少 `request`/`resource`、字段非法，或 `request.url` 首段与 `resource.resourceType` 不一致。
+  - `not-supported`：`request.method` 不是 `POST`/`PUT`。
+  - `processing`：既有资源校验或术语映射失败。
+- `mappings` 为通过校验的各 entry 的术语映射结果（按 entry 顺序拼接）。
+- 审计每次提交一条，含 `request_id`、`actor`、`recorded_at`、`decision`（整体 `200` 为 `accepted`，`400` 为 `rejected`）、`audit_id`（每次提交独立生成）、`bundle_type`、`entry_total`、`entry_succeeded`、`entry_failed`、`status`（最终状态）及 `entries`（逐项 `index`、`resource_type`、`stage`、`status`、`issues` 问题代码）。`stage` 为 `request` / `validation` / `mapping` / `completed`。审计不保存资源正文、患者姓名、标识或术语映射原文。
+
+```json
+{
+  "status": 400,
+  "resource_type": "Bundle",
+  "resource": {
+    "resourceType": "Bundle",
+    "type": "transaction-response",
+    "entry": [
+      { "index": 0, "resourceType": "Patient", "status": 200 },
+      {
+        "index": 1,
+        "resourceType": "Observation",
+        "status": 400,
+        "outcome": {
+          "resourceType": "OperationOutcome",
+          "issue": [
+            {
+              "severity": "error",
+              "code": "invalid",
+              "entryIndex": 1,
+              "expression": ["Bundle.entry[1].request.url"],
+              "diagnostics": "Bundle.entry[1].request.url 首段必须与 resource.resourceType 一致"
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "mappings": [],
+  "audit": { "...": "见上文审计字段" }
+}
+```
+
+> 注：整体 `400` 是批量执行的正常结果（响应与审计照常产生），不是网关错误；只有顶层 JSON 无法解析、请求结构或 `audit_context` 非法、term_maps 非法、审计写入失败等才走下文的错误输出。
 
 ## 错误输出
 
@@ -136,7 +211,7 @@ python3 test_fhir_gateway.py
 
 ## 状态
 
-已实现 `fhir-gateway`：资源校验、术语映射、审计留痕端到端可用，支持单资源与 FHIR R4 Bundle，含 38 个端到端测试。
+已实现 `fhir-gateway`：资源校验、术语映射、审计留痕端到端可用，支持单资源与 FHIR R4 Bundle；`transaction`/`batch` Bundle 支持批量执行语义（逐项校验与映射、整体 200/400、OperationOutcome、逐项审计），含 54 个端到端测试。
 
 ## 约定
 

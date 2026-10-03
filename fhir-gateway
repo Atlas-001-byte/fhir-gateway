@@ -6,7 +6,10 @@
 
 仅使用 Python 标准库，从零实现，不依赖任何外部 FHIR/术语库。
 支持单个 Patient/Observation/Condition，或 FHIR R4 Bundle（含若干 entry 资源）。
-成功: stdout 一行 JSON；审计记录追加到 --audit-file (JSON Lines)，每个 Bundle 一条。
+type 为 transaction / batch 的 Bundle 走批量执行语义：逐项校验与术语映射，
+整体状态 200/400，响应为 transaction-response / batch-response Bundle，
+不写业务资源库；其余类型 Bundle 与单资源行为不变。
+成功: stdout 一行 JSON；审计记录追加到 --audit-file (JSON Lines)，每次提交一条。
 失败: stdout 为空；stderr 一行 {"error": {...}}；退出码 2。
 """
 
@@ -30,6 +33,12 @@ BUNDLE_TYPES = (
     "searchset",
     "collection",
 )
+
+# 走批量执行语义的 Bundle.type；其余类型沿用单资源式整体校验。
+EXECUTION_BUNDLE_TYPES = ("transaction", "batch")
+
+# transaction / batch entry 的 request.method 仅支持这两种。
+ENTRY_METHODS = ("POST", "PUT")
 
 # FHIR R4 Observation.status
 # http://hl7.org/fhir/R4/valueset-observation-status.html
@@ -220,6 +229,193 @@ def apply_bundle_mappings(bundle, index):
     return mappings
 
 
+def validate_execution_bundle(bundle):
+    """transaction/batch 的 Bundle 级校验；entry 逐项问题留给批量执行逐项判定。"""
+    if not _is_nonempty_str(bundle.get("id")):
+        raise FhirValidationError("Bundle.id 必须为非空字符串")
+
+    if bundle.get("type") not in BUNDLE_TYPES:
+        raise FhirValidationError(
+            "Bundle.type 仅限 %s" % "、".join(BUNDLE_TYPES)
+        )
+
+    if "entry" in bundle and not isinstance(bundle["entry"], list):
+        raise FhirValidationError("Bundle.entry 必须为数组")
+
+
+def _entry_failure(pos, resource_type, stage, code, expression, diagnostics):
+    issue = {
+        "severity": "error",
+        "code": code,
+        "entryIndex": pos,
+        "expression": [expression],
+        "diagnostics": diagnostics,
+    }
+    return {
+        "index": pos,
+        "resource_type": resource_type,
+        "stage": stage,
+        "status": 400,
+        "issues": [issue],
+        "mappings": [],
+    }
+
+
+def evaluate_entry(entry, pos, term_index):
+    """逐项执行 request 检查、既有资源校验与术语映射；结果以数据返回，不抛异常。"""
+    label = "Bundle.entry[%d]" % pos
+    resource_type = None
+    if isinstance(entry, dict) and isinstance(entry.get("resource"), dict):
+        candidate = entry["resource"].get("resourceType")
+        if _is_nonempty_str(candidate):
+            resource_type = candidate
+
+    def fail(stage, code, expression, diagnostics):
+        return _entry_failure(
+            pos, resource_type, stage, code, expression, diagnostics
+        )
+
+    if not isinstance(entry, dict):
+        return fail("request", "invalid", label, "%s 必须为对象" % label)
+
+    request = entry.get("request")
+    if not isinstance(request, dict):
+        return fail(
+            "request", "invalid", label + ".request",
+            "%s.request 必须为对象" % label,
+        )
+    if "resource" not in entry:
+        return fail(
+            "request", "invalid", label + ".resource",
+            "%s 缺少 resource" % label,
+        )
+    resource = entry["resource"]
+
+    method = request.get("method")
+    if not _is_nonempty_str(method):
+        return fail(
+            "request", "invalid", label + ".request.method",
+            "%s.request.method 必须为非空字符串" % label,
+        )
+    if method not in ENTRY_METHODS:
+        return fail(
+            "request", "not-supported", label + ".request.method",
+            "%s.request.method 仅支持 %s" % (label, "、".join(ENTRY_METHODS)),
+        )
+
+    url = request.get("url")
+    if not _is_nonempty_str(url):
+        return fail(
+            "request", "invalid", label + ".request.url",
+            "%s.request.url 必须为非空字符串" % label,
+        )
+    actual_type = resource.get("resourceType") if isinstance(resource, dict) else None
+    if url.split("/")[0] != actual_type:
+        return fail(
+            "request", "invalid", label + ".request.url",
+            "%s.request.url 首段必须与 resource.resourceType 一致" % label,
+        )
+
+    try:
+        validate_resource(resource)
+    except FhirValidationError as exc:
+        return fail("validation", "processing", label + ".resource", str(exc))
+
+    try:
+        mappings = apply_mappings(resource, term_index)
+    except GatewayError as exc:
+        return fail("mapping", "processing", label + ".resource", str(exc))
+
+    return {
+        "index": pos,
+        "resource_type": resource_type,
+        "stage": "completed",
+        "status": 200,
+        "issues": [],
+        "mappings": mappings,
+    }
+
+
+def process_execution_bundle(bundle, term_maps, audit_context, audit_path):
+    """transaction/batch 批量执行：逐项校验与映射，不落业务库，每次提交一条审计。"""
+    validate_execution_bundle(bundle)
+    term_index = build_term_index(term_maps)
+
+    entries = bundle.get("entry") or []
+    results = [
+        evaluate_entry(entry, pos, term_index)
+        for pos, entry in enumerate(entries)
+    ]
+    failed = [r for r in results if r["status"] != 200]
+
+    # transaction 全有或全无：任一失败整体 400；batch 各项独立，整体恒 200。
+    if bundle["type"] == "transaction" and failed:
+        overall_status = 400
+    else:
+        overall_status = 200
+
+    response_entries = []
+    for r in results:
+        item = {
+            "index": r["index"],
+            "resourceType": r["resource_type"],
+            "status": r["status"],
+        }
+        if r["issues"]:
+            item["outcome"] = {
+                "resourceType": "OperationOutcome",
+                "issue": r["issues"],
+            }
+        response_entries.append(item)
+
+    response_bundle = {
+        "resourceType": "Bundle",
+        "type": bundle["type"] + "-response",
+        "entry": response_entries,
+    }
+
+    mappings = []
+    for r in results:
+        mappings.extend(r["mappings"])
+
+    # 审计只留结构元数据：索引、资源类型、阶段、状态与问题代码；
+    # 不写资源正文、患者姓名/标识，也不写术语映射原文。
+    audit = {
+        "request_id": audit_context["request_id"],
+        "actor": audit_context["actor"],
+        "recorded_at": audit_context["recorded_at"],
+        "decision": "accepted" if overall_status == 200 else "rejected",
+        "audit_id": uuid.uuid4().hex,
+        "bundle_type": bundle["type"],
+        "entry_total": len(results),
+        "entry_succeeded": len(results) - len(failed),
+        "entry_failed": len(failed),
+        "status": overall_status,
+        "entries": [
+            {
+                "index": r["index"],
+                "resource_type": r["resource_type"],
+                "stage": r["stage"],
+                "status": r["status"],
+                "issues": [issue["code"] for issue in r["issues"]],
+            }
+            for r in results
+        ],
+    }
+
+    # 先落审计，再输出 stdout，保证审计失败时 stdout 一定为空。
+    append_audit_line(audit_path, audit)
+
+    result = {
+        "status": overall_status,
+        "resource_type": "Bundle",
+        "resource": response_bundle,
+        "mappings": mappings,
+        "audit": audit,
+    }
+    return json.dumps(result, ensure_ascii=False)
+
+
 def append_audit_line(path, audit):
     """将审计 JSON 追加为 JSON Lines 的一行，保留已有行。"""
     line = json.dumps(audit, ensure_ascii=False) + "\n"
@@ -309,6 +505,9 @@ def process(raw_text, audit_path):
     validate_audit_context(audit_context)
 
     is_bundle = isinstance(resource, dict) and resource.get("resourceType") == "Bundle"
+    if is_bundle and resource.get("type") in EXECUTION_BUNDLE_TYPES:
+        # transaction / batch：批量执行语义，整体状态 200/400，仍返回 0 退出码。
+        return process_execution_bundle(resource, term_maps, audit_context, audit_path)
     if is_bundle:
         # 顺序：Bundle 自身 → 各 entry.resource（均在 term_maps 校验之前）。
         validate_bundle(resource)

@@ -15,10 +15,14 @@
 
 ```sh
 fhir-gateway --audit-file PATH < request.json
+fhir-gateway --audit-chain --audit-file PATH < request.json
+fhir-gateway --verify-audit --audit-file PATH
 ```
 
 - `--audit-file PATH`（必需）：审计 JSON Lines 文件；文件不存在则创建，已存在则保留旧行并追加。
-- 请求 JSON 从标准输入读取。
+- `--audit-chain`（可选）：为审计增加可离线复核的完整性链；不开启时行为完全不变。
+- `--verify-audit`（可选）：只校验链式文件，不读取标准输入。
+- 请求 JSON 从标准输入读取（校验模式除外）。
 
 ## 请求格式
 
@@ -212,6 +216,48 @@ entry 规则（按此顺序检查，命中首个问题即记录）：
 - 审计不保存资源正文、患者姓名、标识或术语映射原文，逐项只记录索引、资源类型、阶段、结果状态和问题代码。
 - 审计写入失败仍返回 `AuditWriteError` 且 stdout 为空。
 
+## 审计完整性链（--audit-chain）
+
+开启 `--audit-chain` 后，每次提交的审计行增加一个 `audit_digest` 字段，把历次审计串成一条可离线复核的 SHA-256 链。
+
+- 不开启时行为完全不变：继续读取任意已有 JSON Lines，保留旧行后追加，审计对象不含 `audit_digest`。
+- 开启后 **stdout 中的 `audit` 与落盘行一致**（均含 `audit_digest`）；既有字段与 transaction/batch 的批量摘要字段不变；资源正文与术语映射原文仍不入审计。
+- 链式行以规范 JSON 落盘：对象键按 Unicode 码点升序、分隔符后无空格、非 ASCII 原样保留（UTF-8，不转义）。
+
+`audit_digest` 为 SHA-256 的 64 位小写十六进制值，按 UTF-8 对以下内容计算：
+
+```
+上一条 audit_digest + "\n" + 本条移除 audit_digest 字段后的规范 JSON
+```
+
+首条的前序摘要为 64 个 `0`。因此任一行正文被篡改、行被重排或伪造，都会在复核时断链。
+
+链式追加只接受三种目标文件：
+
+1. 文件不存在（创建后从 genesis 开始）；
+2. 文件为空（同上）；
+3. 文件中**每一行都能通过链式校验**。
+
+发现非链式行、摘要不匹配、重复 `audit_id`、缺字段（`audit_id`/`audit_digest`）或非对象行时返回 `AuditWriteError`，**不追加本条**，已有内容保持不变。
+
+### 离线校验（--verify-audit）
+
+```sh
+fhir-gateway --verify-audit --audit-file PATH
+```
+
+只校验链式文件从首行到末行的结构、`audit_id` 唯一性与摘要连续性，**不读取标准输入**。成功时 stdout 输出一行 JSON（退出码 `0`），字段顺序固定：
+
+```json
+{"status": "valid", "line_count": 2, "last_audit_id": "...", "last_audit_digest": "..."}
+```
+
+- `status` 恒为 `"valid"`；`line_count` 为校验通过的行数。
+- 空文件计数为 `0`，`last_audit_id` 与 `last_audit_digest` 为 `null`。
+- 以下情形返回 `AuditVerificationError`：JSON 解析失败、行非对象、`audit_digest` 缺失或格式错误、`audit_id` 为空或重复、摘要链断裂。
+- 文件缺失、路径为目录、父目录不存在或读取失败返回 `AuditReadError`。
+- 两类校验错误均 **stdout 为空**、stderr 一行 JSON、退出码 `2`。
+
 ## 错误输出
 
 任意受控错误：**stdout 为空**，stderr 一行 JSON，退出码 `2`，且**不写审计文件**：
@@ -225,7 +271,9 @@ entry 规则（按此顺序检查，命中首个问题即记录）：
 | `InputError` | 标准输入不是合法 JSON、请求结构非法、缺少字段、`audit_context` 非法 |
 | `FhirValidationError` | 资源类型/id/status/编码不满足校验规则 |
 | `TermMappingError` | 映射项字段非法，或同一源编码存在多个不同目标（transaction/batch 中降级为逐项 `processing`） |
-| `AuditWriteError` | 缺少 `--audit-file`、路径为目录、父目录不存在、无权限或追加写入不完整；此时 stdout 为空 |
+| `AuditWriteError` | 缺少 `--audit-file`、路径为目录、父目录不存在、无权限或追加写入不完整；链式模式下目标文件存在非链式行、摘要不匹配、重复 `audit_id`、缺字段或非对象行；此时 stdout 为空 |
+| `AuditReadError` | `--verify-audit` 时文件缺失、路径为目录、父目录不存在或读取失败 |
+| `AuditVerificationError` | `--verify-audit` 时 JSON 解析失败、行非对象、`audit_digest` 缺失/格式错误、`audit_id` 为空/重复或摘要链断裂 |
 
 > 注：审计在 stdout 输出之前落盘，因此 `AuditWriteError` 发生时 stdout 保证为空。
 
@@ -237,7 +285,7 @@ python3 test_fhir_gateway.py
 
 ## 状态
 
-已实现 `fhir-gateway`：资源校验、术语映射、审计留痕端到端可用，支持单资源与 FHIR R4 Bundle；transaction/batch Bundle 支持批量执行语义（逐项校验与映射、transaction-response/batch-response、全有或全无/逐项独立、逐项审计），含 52 个端到端测试。
+已实现 `fhir-gateway`：资源校验、术语映射、审计留痕端到端可用，支持单资源与 FHIR R4 Bundle；transaction/batch Bundle 支持批量执行语义（逐项校验与映射、transaction-response/batch-response、全有或全无/逐项独立、逐项审计）；`--audit-chain` 提供基于 SHA-256 的审计完整性链，`--verify-audit` 支持离线复核，含 76 个端到端测试。
 
 ## 约定
 

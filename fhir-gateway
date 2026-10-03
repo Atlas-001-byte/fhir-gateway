@@ -16,6 +16,20 @@ import uuid
 
 ALLOWED_RESOURCE_TYPES = ("Patient", "Observation", "Condition")
 
+# FHIR R4 Bundle.type
+# http://hl7.org/fhir/R4/valueset-bundle-type.html
+BUNDLE_TYPES = (
+    "document",
+    "message",
+    "transaction",
+    "transaction-response",
+    "batch",
+    "batch-response",
+    "history",
+    "searchset",
+    "collection",
+)
+
 # FHIR R4 Observation.status
 # http://hl7.org/fhir/R4/valueset-observation-status.html
 OBSERVATION_STATUSES = (
@@ -108,6 +122,38 @@ def validate_resource(resource):
 
     if resource_type == "Condition":
         _primary_coding(resource.get("clinicalStatus"), "Condition.clinicalStatus")
+
+
+def validate_bundle(bundle):
+    """校验 FHIR R4 Bundle 结构及其每个 entry.resource（沿用单资源校验）。"""
+    if not isinstance(bundle, dict):
+        raise FhirValidationError("resource 必须为对象")
+
+    if bundle.get("resourceType") != "Bundle":
+        raise FhirValidationError("resource.resourceType 必须为 Bundle")
+
+    if not _is_nonempty_str(bundle.get("id")):
+        raise FhirValidationError("Bundle.id 必须为非空字符串")
+
+    if bundle.get("type") not in BUNDLE_TYPES:
+        raise FhirValidationError(
+            "Bundle.type 仅限 %s" % "、".join(BUNDLE_TYPES)
+        )
+
+    if "entry" in bundle:
+        entries = bundle["entry"]
+        if not isinstance(entries, list):
+            raise FhirValidationError("Bundle.entry 必须为数组")
+        for pos, entry in enumerate(entries):
+            label = "Bundle.entry[%d]" % pos
+            if not isinstance(entry, dict):
+                raise FhirValidationError("%s 必须为对象" % label)
+            if "resource" not in entry:
+                raise FhirValidationError("%s 缺少 resource" % label)
+            try:
+                validate_resource(entry["resource"])
+            except FhirValidationError as exc:
+                raise FhirValidationError("%s.resource: %s" % (label, exc))
 
 
 def validate_audit_context(audit_context):
@@ -253,9 +299,25 @@ def process(raw_text, audit_path):
     audit_context = request["audit_context"]
 
     validate_audit_context(audit_context)
-    validate_resource(resource)
+
+    # Bundle 与单资源都在这一步完成 FHIR 结构校验；
+    # Bundle 的每个 entry.resource 沿用单资源校验（顺序在 term_maps 之前）。
+    is_bundle = isinstance(resource, dict) and resource.get("resourceType") == "Bundle"
+    if is_bundle:
+        validate_bundle(resource)
+    else:
+        validate_resource(resource)
+
+    # build_term_index 内部逐项校验 term_maps 结构并检测同源冲突。
     index = build_term_index(term_maps)
-    mappings = apply_mappings(resource, index)
+
+    if is_bundle:
+        # 按 entry 顺序、各资源内嵌套顺序收集编码；重复编码逐项保留，不合并。
+        mappings = []
+        for entry in resource.get("entry") or []:
+            mappings.extend(apply_mappings(entry["resource"], index))
+    else:
+        mappings = apply_mappings(resource, index)
 
     audit = {
         "request_id": audit_context["request_id"],

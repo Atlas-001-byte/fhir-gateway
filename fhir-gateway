@@ -7,6 +7,7 @@
     fhir-gateway --check-references --audit-file PATH < request.json
     fhir-gateway --audit-errors --audit-file PATH < request.json
     fhir-gateway --strict-types --audit-file PATH < request.json
+    fhir-gateway --require-mappings --audit-file PATH < request.json
     fhir-gateway --verify-audit --audit-file PATH
     fhir-gateway --audit-find --audit-file PATH [--request-id ID]
                                                  [--actor A]
@@ -34,12 +35,21 @@ recorded_at、decision、audit_id、error_type、phase、status；audit_context
 已知字段校验 JSON 类型与日期/枚举格式（未知字段原样保留）；单资源、非执行
 Bundle 的 entry.resource 与 transaction/batch 逐项均覆盖，批量中严格失败记
 processing；不开启时行为完全不变。
+--require-mappings 开启强制映射：仍先完成请求结构、audit_context、资源、
+引用与严格类型校验（保留同源冲突优先级），再按资源 coding 顺序要求源编码
+精确命中 term_maps 的 target_system 与 target_code；单资源或非 transaction/
+batch Bundle 任一编码未命中即 TermMappingError（退出码 2，不写审计），
+transaction 任一 entry 未映射整批 400，batch 失败 entry 400/processing、
+其余继续、整体 200；映射语义与成功输出字段顺序不变，编码值、映射配置与
+资源正文不入审计；不开启时行为完全不变。
 --audit-find 只读检索审计 JSON Lines，不读 stdin、不写审计、不执行其他功能。
 可按 --request-id、--actor（精确匹配）、--decision（accepted/rejected）与
 --from/--to（按 recorded_at 含边界，YYYY-MM-DDTHH:MM:SSZ）过滤，条件同时
 满足，空条件返回全部；输出一行 {"count": N, "records": [...]}，保持行序不去
 重，仅展示安全字段。--audit-chain/--audit-errors/--strict-types/
---check-references 与本模式同用时不改变检索结果；--verify-audit 与其互斥。
+--check-references 与本模式同用时不改变检索结果；--verify-audit、
+--require-mappings 与其互斥；--verify-audit 与 --require-mappings 同用亦为
+InputError。
 """
 
 import datetime
@@ -689,6 +699,26 @@ def apply_bundle_mappings(bundle, index):
     return mappings
 
 
+def ensure_mappings_required(resource, index):
+    """--require-mappings：按 coding 顺序要求源编码精确命中目标。
+
+    资源、引用与严格类型校验均已通过后调用；index 已由 build_term_index
+    构建（同源冲突已先抛出 TermMappingError）。任一 system/code 未在
+    term_maps 中精确命中即 TermMappingError。
+    """
+    codings = []
+    _find_codings(resource, codings)
+    for coding in codings:
+        if index.get((coding["system"], coding["code"])) is None:
+            raise TermMappingError(
+                "源编码 %s 未配置映射目标"
+                % json.dumps(
+                    {"system": coding["system"], "code": coding["code"]},
+                    ensure_ascii=False,
+                )
+            )
+
+
 def _entry_resource_type(entry):
     """尽力取 entry.resource.resourceType，用于响应与审计；取不到为 None。"""
     if isinstance(entry, dict):
@@ -699,13 +729,16 @@ def _entry_resource_type(entry):
 
 
 def check_bundle_entry(
-    pos, entry, term_index, term_index_error, strict=False
+    pos, entry, term_index, term_index_error, strict=False,
+    require_mappings=False,
 ):
     """按顺序执行单条 entry 的结构、校验与映射检查。
 
     返回 (phase, code, expression, message)；全部通过返回 None。
     code 取值：invalid（缺 request/resource、URL 类型不一致）、
     not-supported（method 不支持）、processing（校验或映射失败）。
+    --require-mappings 开启时，entry 资源内任一编码未命中映射目标记为
+    mapping/processing；关闭时映射阶段行为不变。
     """
     label = "Bundle.entry[%d]" % pos
     if not isinstance(entry, dict):
@@ -754,15 +787,26 @@ def check_bundle_entry(
     if term_index_error is not None:
         return ("mapping", "processing", label + ".resource", str(term_index_error))
     apply_mappings(resource, term_index)
+    if require_mappings:
+        try:
+            ensure_mappings_required(resource, term_index)
+        except TermMappingError as exc:
+            return ("mapping", "processing", label + ".resource", str(exc))
     return None
 
 
 def execute_bundle_entry(
-    pos, entry, term_index, term_index_error, strict=False
+    pos, entry, term_index, term_index_error, strict=False,
+    require_mappings=False,
 ):
     """执行单条 entry，返回响应 entry 与审计 entry（不写业务资源库）。"""
     failure = check_bundle_entry(
-        pos, entry, term_index, term_index_error, strict=strict
+        pos,
+        entry,
+        term_index,
+        term_index_error,
+        strict=strict,
+        require_mappings=require_mappings,
     )
     status = 400 if failure is not None else 200
 
@@ -799,7 +843,8 @@ def execute_bundle_entry(
 
 
 def process_executable_bundle(
-    bundle, term_maps, audit_context, audit_path, chained=False, strict=False
+    bundle, term_maps, audit_context, audit_path, chained=False, strict=False,
+    require_mappings=False,
 ):
     """transaction/batch：按 entry 顺序逐项校验与映射，汇总为响应 Bundle。"""
     if not _is_nonempty_str(bundle.get("id")):
@@ -818,7 +863,12 @@ def process_executable_bundle(
 
     results = [
         execute_bundle_entry(
-            pos, entry, term_index, term_index_error, strict=strict
+            pos,
+            entry,
+            term_index,
+            term_index_error,
+            strict=strict,
+            require_mappings=require_mappings,
         )
         for pos, entry in enumerate(entries)
     ]
@@ -1189,6 +1239,7 @@ def parse_args(argv):
     check_references = False
     audit_errors = False
     strict_types = False
+    require_mappings = False
     filters = {
         "request_id": None,
         "actor": None,
@@ -1239,6 +1290,9 @@ def parse_args(argv):
             i += 1
         elif arg == "--strict-types":
             strict_types = True
+            i += 1
+        elif arg == "--require-mappings":
+            require_mappings = True
             i += 1
         elif arg == "--verify-audit":
             verify = True
@@ -1334,9 +1388,15 @@ def parse_args(argv):
     if verify and strict_types:
         # 校验模式只读、不读 stdin、不追加，与严格类型校验互斥。
         raise InputError("--verify-audit 不能与 --strict-types 同用")
+    if verify and require_mappings:
+        # 校验模式只读、不读请求，与强制映射互斥。
+        raise InputError("--verify-audit 不能与 --require-mappings 同用")
     if find and verify:
         # 检索与离线校验为两个独立只读入口，不可同用。
         raise InputError("--audit-find 不能与 --verify-audit 同用")
+    if find and require_mappings:
+        # 检索只读、不读请求、不做校验/映射，与强制映射互斥。
+        raise InputError("--audit-find 不能与 --require-mappings 同用")
     if not find:
         # 过滤参数仅属于 --audit-find，其他入口不接受。
         used = [
@@ -1357,6 +1417,7 @@ def parse_args(argv):
         check_references,
         audit_errors,
         strict_types,
+        require_mappings,
         filters,
     )
 
@@ -1367,6 +1428,7 @@ def process(
     chained=False,
     check_references=False,
     strict_types=False,
+    require_mappings=False,
 ):
     try:
         request = json.loads(raw_text)
@@ -1396,6 +1458,7 @@ def process(
             audit_path,
             chained,
             strict=strict_types,
+            require_mappings=require_mappings,
         )
     if is_bundle:
         # 顺序：Bundle 自身 → 各 entry.resource（均在 term_maps 校验之前）。
@@ -1409,6 +1472,14 @@ def process(
         if check_references:
             check_resource_references(resource)
     index = build_term_index(term_maps)
+    if require_mappings:
+        # build_term_index 已先报非法映射项与同源冲突；此处按 entry 顺序、
+        # 资源内 coding 顺序要求每个源编码精确命中，首个未命中即拒绝。
+        if is_bundle:
+            for entry in resource.get("entry") or []:
+                ensure_mappings_required(entry["resource"], index)
+        else:
+            ensure_mappings_required(resource, index)
     mappings = (
         apply_bundle_mappings(resource, index)
         if is_bundle
@@ -1450,6 +1521,7 @@ def main(argv):
             check_references,
             audit_errors,
             strict_types,
+            require_mappings,
             filters,
         ) = parse_args(argv)
     except GatewayError as exc:
@@ -1492,6 +1564,7 @@ def main(argv):
             chained,
             check_references,
             strict_types,
+            require_mappings,
         )
     except GatewayError as exc:
         if audit_errors and _rejection_phase(exc) is not None:

@@ -6,6 +6,7 @@
     fhir-gateway --audit-chain --audit-file PATH < request.json
     fhir-gateway --check-references --audit-file PATH < request.json
     fhir-gateway --audit-errors --audit-file PATH < request.json
+    fhir-gateway --strict-types --audit-file PATH < request.json
     fhir-gateway --verify-audit --audit-file PATH
 
 仅使用 Python 标准库，从零实现，不依赖任何外部 FHIR/术语库。
@@ -24,8 +25,13 @@ Bundle 的 ResourceType/id 必须在 entry.resource 中唯一命中；单资源�
 --audit-file 追加一条 decision=rejected 的审计记录（仅含 request_id、actor、
 recorded_at、decision、audit_id、error_type、phase、status；audit_context
 三值任一缺失则三项为 null），再按原样输出错误；不开启时行为完全不变。
+--strict-types 开启 FHIR R4 已知字段的类型收紧（Patient/Observation/Condition
+及 CodeableConcept 的字段形态、日期与 value[x] 基数），未知字段原样保留；
+单资源、Bundle entry.resource 与 transaction/batch 逐项均生效，不开启时
+行为完全不变。--verify-audit 与 --strict-types 互斥（InputError）。
 """
 
+import datetime
 import hashlib
 import json
 import os
@@ -192,7 +198,7 @@ def _primary_coding(codeable_concept, label):
     return coding
 
 
-def validate_resource(resource):
+def validate_resource(resource, strict=False):
     """按任务约定校验 Patient / Observation / Condition。"""
     if not isinstance(resource, dict):
         raise FhirValidationError("resource 必须为对象")
@@ -216,8 +222,12 @@ def validate_resource(resource):
     if resource_type == "Condition":
         _primary_coding(resource.get("clinicalStatus"), "Condition.clinicalStatus")
 
+    if strict:
+        # --strict-types：在既有校验之上收紧已知字段的 FHIR R4 类型。
+        validate_resource_types(resource)
 
-def validate_bundle(bundle):
+
+def validate_bundle(bundle, strict=False):
     """校验 FHIR R4 Bundle：非空 id、合法 type，entry 内资源逐项校验。"""
     if not isinstance(bundle, dict):
         raise FhirValidationError("resource 必须为对象")
@@ -244,7 +254,167 @@ def validate_bundle(bundle):
             if "resource" not in entry:
                 raise FhirValidationError("%s 缺少 resource" % label)
             # entry 内复用同一套 Patient/Observation/Condition 校验。
-            validate_resource(entry["resource"])
+            validate_resource(entry["resource"], strict)
+
+
+# ---- --strict-types：FHIR R4 已知字段类型收紧 --------------------------------
+
+# FHIR R4 Patient.gender
+# http://hl7.org/fhir/R4/valueset-administrative-gender.html
+PATIENT_GENDERS = ("male", "female", "other", "unknown")
+
+_FHIR_DATE_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})$")
+# ISO8601：YYYY-MM-DD，可带 Thh:mm[:ss[.f...]] 与 Z 或 ±hh:mm 时区。
+_FHIR_DATETIME_RE = re.compile(
+    r"^(\d{4})-(\d{2})-(\d{2})"
+    r"(?:T([01]\d|2[0-3]):([0-5]\d)(?::([0-5]\d)(?:\.\d+)?)?"
+    r"(Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)?)?$"
+)
+
+
+def _valid_ymd(year, month, day):
+    try:
+        datetime.date(int(year), int(month), int(day))
+    except ValueError:
+        return False
+    return True
+
+
+def _is_fhir_date(value):
+    """YYYY-MM-DD 且为真实存在的日期。"""
+    if not isinstance(value, str):
+        return False
+    match = _FHIR_DATE_RE.fullmatch(value)
+    return bool(match) and _valid_ymd(*match.groups())
+
+
+def _is_fhir_datetime(value):
+    """ISO8601 日期或日期时间，日期部分必须真实存在。"""
+    if not isinstance(value, str):
+        return False
+    match = _FHIR_DATETIME_RE.fullmatch(value)
+    return bool(match) and _valid_ymd(*match.group(1, 2, 3))
+
+
+def _strict_object_array(value, label):
+    if not isinstance(value, list):
+        raise FhirValidationError("%s 必须为对象数组" % label)
+    for pos, item in enumerate(value):
+        if not isinstance(item, dict):
+            raise FhirValidationError("%s[%d] 必须为对象" % (label, pos))
+
+
+def _strict_codeable_concept(value, label):
+    """CodeableConcept：对象；coding 为对象数组，其 system/code/display 为
+    字符串、userSelected 为布尔（字段出现即检查，null 与形状错误一律拒绝）。"""
+    if not isinstance(value, dict):
+        raise FhirValidationError("%s 必须为 CodeableConcept 对象" % label)
+    if "coding" in value:
+        coding = value["coding"]
+        if not isinstance(coding, list):
+            raise FhirValidationError("%s.coding 必须为对象数组" % label)
+        for pos, item in enumerate(coding):
+            item_label = "%s.coding[%d]" % (label, pos)
+            if not isinstance(item, dict):
+                raise FhirValidationError("%s 必须为对象" % item_label)
+            for field in ("system", "code", "display"):
+                if field in item and not isinstance(item[field], str):
+                    raise FhirValidationError(
+                        "%s.%s 必须为字符串" % (item_label, field)
+                    )
+            if "userSelected" in item and not isinstance(
+                item["userSelected"], bool
+            ):
+                raise FhirValidationError(
+                    "%s.userSelected 必须为布尔值" % item_label
+                )
+
+
+def _strict_patient(resource):
+    if "active" in resource and not isinstance(resource["active"], bool):
+        raise FhirValidationError("Patient.active 必须为布尔值")
+    if "gender" in resource and resource["gender"] not in PATIENT_GENDERS:
+        raise FhirValidationError(
+            "Patient.gender 仅限 %s" % "、".join(PATIENT_GENDERS)
+        )
+    if "birthDate" in resource and not _is_fhir_date(resource["birthDate"]):
+        raise FhirValidationError(
+            "Patient.birthDate 必须为 YYYY-MM-DD 格式的有效日期"
+        )
+    for field in ("name", "telecom"):
+        if field in resource:
+            _strict_object_array(resource[field], "Patient.%s" % field)
+
+
+def _strict_observation(resource):
+    # status 取值与 code 基本形态已由既有校验保证，这里收紧完整类型。
+    _strict_codeable_concept(resource["code"], "Observation.code")
+    if "valueCodeableConcept" in resource:
+        _strict_codeable_concept(
+            resource["valueCodeableConcept"], "Observation.valueCodeableConcept"
+        )
+    value_keys = [
+        key
+        for key in resource
+        if key.startswith("value") and key[5:6].isupper()
+    ]
+    if len(value_keys) > 1:
+        raise FhirValidationError(
+            "Observation 至多允许一个 value[x]，发现 %s"
+            % "、".join(sorted(value_keys))
+        )
+    if "valueQuantity" in resource and not isinstance(
+        resource["valueQuantity"], dict
+    ):
+        raise FhirValidationError("Observation.valueQuantity 必须为 Quantity 对象")
+    if "valueInteger" in resource:
+        value = resource["valueInteger"]
+        # bool 是 int 的子类，需显式排除。
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise FhirValidationError("Observation.valueInteger 必须为整数")
+    if "valueString" in resource and not isinstance(resource["valueString"], str):
+        raise FhirValidationError("Observation.valueString 必须为字符串")
+    if "valueBoolean" in resource and not isinstance(
+        resource["valueBoolean"], bool
+    ):
+        raise FhirValidationError("Observation.valueBoolean 必须为布尔值")
+    for field in ("effectiveDateTime", "issued"):
+        if field in resource and not _is_fhir_datetime(resource[field]):
+            raise FhirValidationError(
+                "Observation.%s 必须为 ISO8601 日期时间" % field
+            )
+
+
+def _strict_condition(resource):
+    _strict_codeable_concept(
+        resource["clinicalStatus"], "Condition.clinicalStatus"
+    )
+    if "verificationStatus" in resource:
+        _strict_codeable_concept(
+            resource["verificationStatus"], "Condition.verificationStatus"
+        )
+    if "code" in resource:
+        _strict_codeable_concept(resource["code"], "Condition.code")
+    if "onsetDateTime" in resource and not _is_fhir_datetime(
+        resource["onsetDateTime"]
+    ):
+        raise FhirValidationError(
+            "Condition.onsetDateTime 必须为 ISO8601 日期时间"
+        )
+    if "recordedDate" in resource and not _is_fhir_date(resource["recordedDate"]):
+        raise FhirValidationError(
+            "Condition.recordedDate 必须为 YYYY-MM-DD 格式的有效日期"
+        )
+
+
+def validate_resource_types(resource):
+    """--strict-types：按 FHIR R4 收紧已知字段类型；未知字段不检查、原样保留。"""
+    handler = {
+        "Patient": _strict_patient,
+        "Observation": _strict_observation,
+        "Condition": _strict_condition,
+    }[resource["resourceType"]]
+    handler(resource)
 
 
 # 外部完整 URL 仅接受此前缀。
@@ -463,7 +633,7 @@ def _entry_resource_type(entry):
     return None
 
 
-def check_bundle_entry(pos, entry, term_index, term_index_error):
+def check_bundle_entry(pos, entry, term_index, term_index_error, strict=False):
     """按顺序执行单条 entry 的结构、校验与映射检查。
 
     返回 (phase, code, expression, message)；全部通过返回 None。
@@ -508,7 +678,7 @@ def check_bundle_entry(pos, entry, term_index, term_index_error):
         )
 
     try:
-        validate_resource(resource)
+        validate_resource(resource, strict)
     except FhirValidationError as exc:
         return ("validation", "processing", label + ".resource", str(exc))
 
@@ -518,9 +688,9 @@ def check_bundle_entry(pos, entry, term_index, term_index_error):
     return None
 
 
-def execute_bundle_entry(pos, entry, term_index, term_index_error):
+def execute_bundle_entry(pos, entry, term_index, term_index_error, strict=False):
     """执行单条 entry，返回响应 entry 与审计 entry（不写业务资源库）。"""
-    failure = check_bundle_entry(pos, entry, term_index, term_index_error)
+    failure = check_bundle_entry(pos, entry, term_index, term_index_error, strict)
     status = 400 if failure is not None else 200
 
     response_entry = {"resourceType": _entry_resource_type(entry), "status": status}
@@ -555,7 +725,9 @@ def execute_bundle_entry(pos, entry, term_index, term_index_error):
     }
 
 
-def process_executable_bundle(bundle, term_maps, audit_context, audit_path, chained=False):
+def process_executable_bundle(
+    bundle, term_maps, audit_context, audit_path, chained=False, strict=False
+):
     """transaction/batch：按 entry 顺序逐项校验与映射，汇总为响应 Bundle。"""
     if not _is_nonempty_str(bundle.get("id")):
         raise FhirValidationError("Bundle.id 必须为非空字符串")
@@ -572,7 +744,7 @@ def process_executable_bundle(bundle, term_maps, audit_context, audit_path, chai
         term_index_error = exc
 
     results = [
-        execute_bundle_entry(pos, entry, term_index, term_index_error)
+        execute_bundle_entry(pos, entry, term_index, term_index_error, strict)
         for pos, entry in enumerate(entries)
     ]
     failed = sum(1 for r in results if r["status"] != 200)
@@ -824,6 +996,7 @@ def parse_args(argv):
     verify = False
     check_references = False
     audit_errors = False
+    strict_types = False
     i = 0
     while i < len(argv):
         arg = argv[i]
@@ -849,6 +1022,9 @@ def parse_args(argv):
         elif arg == "--audit-errors":
             audit_errors = True
             i += 1
+        elif arg == "--strict-types":
+            strict_types = True
+            i += 1
         elif arg == "--verify-audit":
             verify = True
             i += 1
@@ -860,10 +1036,22 @@ def parse_args(argv):
     if verify and audit_errors:
         # 校验模式只读、不追加，与拒绝审计互斥。
         raise InputError("--verify-audit 不能与 --audit-errors 同用")
-    return audit_path, chained, verify, check_references, audit_errors
+    if verify and strict_types:
+        # 校验模式不读 stdin、不处理资源，与类型收紧互斥。
+        raise InputError("--verify-audit 不能与 --strict-types 同用")
+    return (
+        audit_path,
+        chained,
+        verify,
+        check_references,
+        audit_errors,
+        strict_types,
+    )
 
 
-def process(raw_text, audit_path, chained=False, check_references=False):
+def process(
+    raw_text, audit_path, chained=False, check_references=False, strict_types=False
+):
     try:
         request = json.loads(raw_text)
     except (json.JSONDecodeError, ValueError) as exc:
@@ -886,17 +1074,17 @@ def process(raw_text, audit_path, chained=False, check_references=False):
     if is_bundle and resource.get("type") in EXECUTABLE_BUNDLE_TYPES:
         # transaction/batch：批量执行语义，entry 问题进入响应而非网关级错误。
         return process_executable_bundle(
-            resource, term_maps, audit_context, audit_path, chained
+            resource, term_maps, audit_context, audit_path, chained, strict_types
         )
     if is_bundle:
         # 顺序：Bundle 自身 → 各 entry.resource（均在 term_maps 校验之前）。
-        validate_bundle(resource)
+        validate_bundle(resource, strict_types)
         if check_references:
             # 非 transaction/batch Bundle：引用校验同样位于 term_maps 之前，
             # 失败时为 FhirValidationError，不写审计。
             check_bundle_references(resource)
     else:
-        validate_resource(resource)
+        validate_resource(resource, strict_types)
         if check_references:
             check_resource_references(resource)
     index = build_term_index(term_maps)
@@ -933,9 +1121,14 @@ def process(raw_text, audit_path, chained=False, check_references=False):
 
 def main(argv):
     try:
-        audit_path, chained, verify, check_references, audit_errors = parse_args(
-            argv
-        )
+        (
+            audit_path,
+            chained,
+            verify,
+            check_references,
+            audit_errors,
+            strict_types,
+        ) = parse_args(argv)
     except GatewayError as exc:
         _emit_error(exc)
         return 2
@@ -958,7 +1151,9 @@ def main(argv):
         return 2
 
     try:
-        output = process(raw_text, audit_path, chained, check_references)
+        output = process(
+            raw_text, audit_path, chained, check_references, strict_types
+        )
     except GatewayError as exc:
         if audit_errors and _rejection_phase(exc) is not None:
             # 拒绝审计：先追加 rejected 记录，再按原样输出错误。

@@ -2011,5 +2011,446 @@ class AuditErrorsTests(unittest.TestCase):
         self.assertEqual(err["type"], "AuditWriteError")
 
 
+STRICT_ARGS = ["--strict-types"]
+
+
+def run_strict(payload, audit_file, args=None, raw=None):
+    return run(payload, audit_file, args=STRICT_ARGS + (args or []), raw=raw)
+
+
+class StrictTypesTests(unittest.TestCase):
+    def assert_strict_error(self, proc, audit_file, fragment=None):
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        self.assertEqual(proc.stdout, "")
+        self.assertFalse(os.path.exists(audit_file))
+        err = json.loads(proc.stderr)
+        self.assertEqual(err["error"]["type"], "FhirValidationError")
+        self.assertTrue(err["error"]["message"])
+        # stderr 恰好一行 JSON。
+        self.assertEqual(proc.stderr.count("\n"), 1)
+        if fragment is not None:
+            self.assertIn(fragment, err["error"]["message"])
+        return err["error"]["message"]
+
+    def _patient(self, **fields):
+        resource = {"resourceType": "Patient", "id": "pat-1"}
+        resource.update(fields)
+        return resource
+
+    def _observation(self, **fields):
+        resource = {
+            "resourceType": "Observation",
+            "id": "obs-1",
+            "status": "final",
+            "code": {"coding": [{"system": "http://loinc.org", "code": "8867-4"}]},
+        }
+        resource.update(fields)
+        return resource
+
+    def _condition(self, **fields):
+        resource = {
+            "resourceType": "Condition",
+            "id": "cond-1",
+            "clinicalStatus": {
+                "coding": [{"system": "http://x", "code": "active"}]
+            },
+        }
+        resource.update(fields)
+        return resource
+
+    # ---- 关闭时行为不变 ----------------------------------------------------
+
+    def test_flag_off_bad_types_accepted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            resource = self._patient(
+                active="yes", gender="unknown2", birthDate="not-a-date",
+                name={"family": "Doe"}, telecom=[1, 2],
+            )
+            proc = run(base_request(resource=resource, term_maps=[]), audit_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    # ---- Patient -----------------------------------------------------------
+
+    def test_patient_valid_strict_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            resource = self._patient(
+                active=True,
+                gender="other",
+                birthDate="1980-02-29",
+                name=[{"family": "Doe", "given": ["Jane"]}],
+                telecom=[{"system": "phone", "value": "123"}],
+                extraUnknown={"kept": [1]},
+            )
+            req = base_request(resource=resource, term_maps=[])
+            proc = run_strict(req, audit_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            out = json.loads(proc.stdout)
+            # 输出字段不变，未知字段原样保留。
+            self.assertEqual(
+                list(out.keys()),
+                ["status", "resource_type", "resource", "mappings", "audit"],
+            )
+            self.assertEqual(out["resource"], resource)
+
+    def test_patient_active_must_be_boolean(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            for bad in ("true", 1, 0, None, [], {}):
+                req = base_request(resource=self._patient(active=bad), term_maps=[])
+                proc = run_strict(req, audit_file)
+                self.assert_strict_error(proc, audit_file, "Patient.active")
+
+    def test_patient_gender_enum(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ok_file = os.path.join(tmp, "ok.jsonl")
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            for ok in ("male", "female", "other", "unknown"):
+                req = base_request(resource=self._patient(gender=ok), term_maps=[])
+                proc = run_strict(req, ok_file)
+                self.assertEqual(proc.returncode, 0, (ok, proc.stderr))
+            for bad in ("M", "Unknown", "", 1, None, True):
+                req = base_request(resource=self._patient(gender=bad), term_maps=[])
+                proc = run_strict(req, audit_file)
+                self.assert_strict_error(proc, audit_file, "Patient.gender")
+
+    def test_patient_birth_date(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            for bad in (
+                "1980/01/01", "1980-1-1", "1980-13-01", "2023-02-29",
+                "1980-01-01T00:00:00Z", 19800101, None, True,
+            ):
+                req = base_request(
+                    resource=self._patient(birthDate=bad), term_maps=[]
+                )
+                proc = run_strict(req, audit_file)
+                self.assert_strict_error(proc, audit_file, "Patient.birthDate")
+
+    def test_patient_name_telecom_object_arrays(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            for field in ("name", "telecom"):
+                for bad in ({"family": "x"}, "x", None, [1], ["x"], [None], [{} , 2]):
+                    req = base_request(
+                        resource=self._patient(**{field: bad}), term_maps=[]
+                    )
+                    proc = run_strict(req, audit_file)
+                    self.assert_strict_error(
+                        proc, audit_file, "Patient.%s" % field
+                    )
+
+    # ---- Observation -------------------------------------------------------
+
+    def test_observation_valid_strict_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            resource = self._observation(
+                valueQuantity={"value": 6.2, "unit": "mmol/L"},
+                effectiveDateTime="2026-10-03T10:00:00Z",
+                issued="2026-10-03T10:00:00+08:00",
+            )
+            req = base_request(resource=resource, term_maps=[])
+            proc = run_strict(req, audit_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_observation_value_codeable_concept(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ok_file = os.path.join(tmp, "ok.jsonl")
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            ok = self._observation(
+                valueCodeableConcept={
+                    "coding": [
+                        {
+                            "system": "http://s",
+                            "code": "c",
+                            "display": "d",
+                            "userSelected": True,
+                        }
+                    ]
+                }
+            )
+            proc = run_strict(base_request(resource=ok, term_maps=[]), ok_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            for bad in ("x", None, [], {"coding": "x"}, {"coding": [1]},
+                        {"coding": [{"system": 1}]},
+                        {"coding": [{"userSelected": "yes"}]}):
+                resource = self._observation(valueCodeableConcept=bad)
+                proc = run_strict(
+                    base_request(resource=resource, term_maps=[]), audit_file
+                )
+                self.assert_strict_error(
+                    proc, audit_file, "Observation.valueCodeableConcept"
+                )
+
+    def test_observation_at_most_one_value_x(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            resource = self._observation(valueString="a", valueBoolean=True)
+            proc = run_strict(
+                base_request(resource=resource, term_maps=[]), audit_file
+            )
+            self.assert_strict_error(proc, audit_file, "value[x]")
+
+    def test_observation_value_types(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            cases = [
+                ("valueQuantity", [1, "5", None, True, []], "valueQuantity"),
+                ("valueInteger", [1.5, "5", None, True, {}], "valueInteger"),
+                ("valueString", [5, None, True, {}, []], "valueString"),
+                ("valueBoolean", [1, "true", None, 0], "valueBoolean"),
+            ]
+            for field, bad_values, fragment in cases:
+                for bad in bad_values:
+                    resource = self._observation(**{field: bad})
+                    proc = run_strict(
+                        base_request(resource=resource, term_maps=[]), audit_file
+                    )
+                    self.assert_strict_error(proc, audit_file, fragment)
+            # 合法值通过。
+            for field, ok in (
+                ("valueQuantity", {}),
+                ("valueInteger", 0),
+                ("valueString", ""),
+                ("valueBoolean", False),
+            ):
+                resource = self._observation(**{field: ok})
+                proc = run_strict(
+                    base_request(resource=resource, term_maps=[]), audit_file
+                )
+                self.assertEqual(proc.returncode, 0, (field, proc.stderr))
+
+    def test_observation_datetimes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ok_file = os.path.join(tmp, "ok.jsonl")
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            for field in ("effectiveDateTime", "issued"):
+                for ok in (
+                    "2026-10-03",
+                    "2026-10-03T10:00",
+                    "2026-10-03T10:00:00.5Z",
+                    "2026-10-03T10:00:00+08:00",
+                ):
+                    resource = self._observation(**{field: ok})
+                    proc = run_strict(
+                        base_request(resource=resource, term_maps=[]), ok_file
+                    )
+                    self.assertEqual(proc.returncode, 0, (ok, proc.stderr))
+                for bad in (
+                    "2026-13-01", "2026-10-03T25:00", "10:00:00",
+                    "2026-10-03 10:00:00", 123, None,
+                ):
+                    resource = self._observation(**{field: bad})
+                    proc = run_strict(
+                        base_request(resource=resource, term_maps=[]), audit_file
+                    )
+                    self.assert_strict_error(proc, audit_file, field)
+
+    def test_observation_code_coding_shape(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            # 首个 coding 合法（过既有校验），第二个 coding 形状非法。
+            resource = self._observation()
+            resource["code"]["coding"].append({"system": "http://s", "code": 7})
+            proc = run_strict(
+                base_request(resource=resource, term_maps=[]), audit_file
+            )
+            message = self.assert_strict_error(proc, audit_file)
+            self.assertIn("Observation.code.coding[1].code", message)
+
+    # ---- Condition ---------------------------------------------------------
+
+    def test_condition_valid_strict_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            resource = self._condition(
+                verificationStatus={"coding": [{"system": "http://s", "code": "confirmed"}]},
+                code={"coding": [{"system": "http://s", "code": "c"}], "text": "x"},
+                onsetDateTime="2026-10-01T08:30:00Z",
+                recordedDate="2026-10-02",
+            )
+            proc = run_strict(base_request(resource=resource, term_maps=[]), audit_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_condition_codeable_concept_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            for field in ("verificationStatus", "code"):
+                for bad in ("x", None, [], {"coding": [{"display": 3}]}):
+                    resource = self._condition(**{field: bad})
+                    proc = run_strict(
+                        base_request(resource=resource, term_maps=[]), audit_file
+                    )
+                    self.assert_strict_error(
+                        proc, audit_file, "Condition.%s" % field
+                    )
+
+    def test_condition_dates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            for bad in ("2026-10", "2026-10-32", 20261003, None):
+                resource = self._condition(onsetDateTime=bad)
+                proc = run_strict(
+                    base_request(resource=resource, term_maps=[]), audit_file
+                )
+                self.assert_strict_error(proc, audit_file, "onsetDateTime")
+            for bad in ("2026-10-03T00:00:00Z", "2023-02-29", None):
+                resource = self._condition(recordedDate=bad)
+                proc = run_strict(
+                    base_request(resource=resource, term_maps=[]), audit_file
+                )
+                self.assert_strict_error(proc, audit_file, "recordedDate")
+
+    # ---- Bundle / transaction / batch --------------------------------------
+
+    def test_bundle_entry_strict_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            req = bundle_request(
+                [patient_entry(), {"resource": self._patient(active=1)}]
+            )
+            proc = run_strict(req, audit_file)
+            self.assert_strict_error(proc, audit_file, "Patient.active")
+
+    def test_transaction_strict_failure_is_processing_atomic(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            entries = [
+                tx_entry(patient_resource("pat-1")),
+                tx_entry(self._patient(id="pat-2", gender="M")),
+            ]
+            proc = run_strict(executable_request(entries), audit_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            out = json.loads(proc.stdout)
+            # transaction 全有或全无。
+            self.assertEqual(out["status"], 400)
+            entry = out["resource"]["entry"][1]
+            self.assertEqual(entry["status"], 400)
+            issue = entry["outcome"]["issue"][0]
+            self.assertEqual(issue["code"], "processing")
+            self.assertIn("Patient.gender", issue["diagnostics"])
+            self.assertEqual(out["audit"]["entries"][1]["phase"], "validation")
+            self.assertEqual(out["audit"]["entries"][1]["issue_code"], "processing")
+
+    def test_batch_strict_failure_independent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            entries = [
+                tx_entry(patient_resource("pat-1")),
+                tx_entry(self._observation(id="obs-1", valueInteger="5")),
+            ]
+            proc = run_strict(executable_request(entries, "batch"), audit_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            out = json.loads(proc.stdout)
+            # batch 逐项独立，整体 200。
+            self.assertEqual(out["status"], 200)
+            self.assertEqual(
+                [e["status"] for e in out["resource"]["entry"]], [200, 400]
+            )
+            issue = out["resource"]["entry"][1]["outcome"]["issue"][0]
+            self.assertEqual(issue["code"], "processing")
+            self.assertEqual(out["audit"]["entry_failed"], 1)
+
+    def test_executable_strict_ok_when_valid(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            entries = [tx_entry(self._patient(id="pat-1", active=False))]
+            proc = run_strict(executable_request(entries), audit_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(json.loads(proc.stdout)["status"], 200)
+
+    # ---- 组合 ---------------------------------------------------------------
+
+    def test_strict_precedes_reference_check(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            resource = self._patient(active="yes")
+            resource["managingOrganization"] = {"reference": "#ghost"}
+            req = base_request(resource=resource, term_maps=[])
+            proc = run_strict(req, audit_file, args=["--check-references"])
+            # 类型错误先于引用错误。
+            self.assert_strict_error(proc, audit_file, "Patient.active")
+
+    def test_strict_precedes_term_mapping_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            req = base_request(resource=self._patient(active=None))
+            req["term_maps"] = [{"system": "", "code": "c",
+                                 "target_system": "t", "target_code": "x"}]
+            proc = run_strict(req, audit_file)
+            self.assert_strict_error(proc, audit_file, "Patient.active")
+
+    def test_input_error_precedes_strict(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            req = base_request(resource=self._patient(active="yes"), term_maps=[])
+            req["audit_context"]["actor"] = ""
+            proc = run_strict(req, audit_file)
+            self.assertEqual(proc.returncode, 2)
+            self.assertEqual(
+                json.loads(proc.stderr)["error"]["type"], "InputError"
+            )
+            self.assertFalse(os.path.exists(audit_file))
+
+    def test_audit_errors_records_strict_rejection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            req = base_request(resource=self._patient(birthDate="2026-02-30"),
+                               term_maps=[])
+            proc = run_strict(req, audit_file, args=["--audit-errors"])
+            self.assertEqual(proc.returncode, 2)
+            self.assertEqual(proc.stdout, "")
+            err = json.loads(proc.stderr)["error"]
+            self.assertEqual(err["type"], "FhirValidationError")
+            (record,) = read_audit_lines(audit_file)
+            self.assertEqual(record["decision"], "rejected")
+            self.assertEqual(record["error_type"], "FhirValidationError")
+            self.assertEqual(record["phase"], "validation")
+            self.assertEqual(record["status"], 400)
+            self.assertEqual(record["request_id"], "req-1")
+
+    def test_audit_chain_summary_unchanged_with_strict(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            req = base_request(resource=self._patient(active=True), term_maps=[])
+            proc = run_strict(req, audit_file, args=["--audit-chain"])
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            audit = json.loads(proc.stdout)["audit"]
+            self.assertRegex(audit["audit_digest"], r"^[0-9a-f]{64}$")
+            self.assertEqual(
+                set(audit),
+                {"request_id", "actor", "recorded_at", "decision",
+                 "audit_id", "audit_digest"},
+            )
+            result = run_verify(audit_file)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout)["line_count"], 1)
+
+    def test_verify_audit_with_strict_types_is_input_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    GATEWAY,
+                    "--verify-audit",
+                    "--strict-types",
+                    "--audit-file",
+                    audit_file,
+                ],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(result.stdout, "")
+            err = json.loads(result.stderr)["error"]
+            self.assertEqual(err["type"], "InputError")
+            # 不读 stdin、不追加审计。
+            self.assertFalse(os.path.exists(audit_file))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

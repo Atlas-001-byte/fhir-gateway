@@ -18,6 +18,7 @@ fhir-gateway --audit-file PATH < request.json
 fhir-gateway --audit-chain --audit-file PATH < request.json
 fhir-gateway --check-references --audit-file PATH < request.json
 fhir-gateway --audit-errors --audit-file PATH < request.json
+fhir-gateway --strict-types --audit-file PATH < request.json
 fhir-gateway --verify-audit --audit-file PATH
 ```
 
@@ -25,6 +26,7 @@ fhir-gateway --verify-audit --audit-file PATH
 - `--audit-chain`（可选）：为审计增加可离线复核的完整性链；不开启时行为完全不变。
 - `--check-references`（可选）：开启本地引用完整性校验；不开启时解析、校验、映射、输出与审计行为完全不变。
 - `--audit-errors`（可选）：请求处理失败时追加一条 `decision=rejected` 的拒绝审计记录；不开启时行为完全不变。
+- `--strict-types`（可选）：开启 FHIR R4 已知字段的类型收紧校验；不开启时行为完全不变。
 - `--verify-audit`（可选）：只校验链式文件，不读取标准输入。
 - 请求 JSON 从标准输入读取（校验模式除外）。
 
@@ -129,6 +131,19 @@ transaction / batch Bundle（批量执行语义，每个 entry 带 `request`）�
 校验失败属于 `FhirValidationError`：message 含引用值与唯一原因（缺少本地目标 / 目标不唯一 / 非法或形式不受支持），stdout 为空，stderr 为一行 JSON，退出码为 `2`，且不写审计文件。错误优先级不变：顶层结构与 `audit_context` 仍先报 `InputError`；资源自身校验仍先于引用校验；引用校验仍先于术语映射错误，因此资源或引用错误都会在审计写入前终止。
 
 开启该选项不改变成功响应：仍只有 `status`、`resource_type`、`resource`、`mappings`、`audit`（可执行 Bundle 无 `mappings`），不新增字段；资源正文与引用值均不入审计。可与 `--audit-chain` 同时使用，链式规则不受影响。
+
+## 严格类型校验（--strict-types）
+
+`--strict-types` 为可选开关：不开启时解析、校验、映射、输出与审计行为完全不变。开启后在既有资源校验之上，按 FHIR R4 收紧**已知字段**的类型；未知字段不检查、原样保留。对单资源、非执行 Bundle 的 `entry.resource` 与 transaction/batch 的逐项执行同样生效（逐项失败记 `processing`、phase 为 `validation`，transaction 全有或全无、batch 逐项独立）。
+
+收紧规则（字段出现即检查；`null`、形状错误、数字代字符串、无效日期一律拒绝）：
+
+- Patient：`active` 布尔；`gender` 仅限 `male`、`female`、`other`、`unknown`；`birthDate` 为 `YYYY-MM-DD` 格式的有效日期；`name`、`telecom` 为对象数组。
+- Observation：`status` ∈ ObservationStatus（既有规则）；`code`、`valueCodeableConcept` 为 CodeableConcept 对象；`value[x]`（`value` 后接大写字母的字段）至多一个；`valueQuantity` 为对象、`valueInteger` 为整数（布尔不算）、`valueString` 为字符串、`valueBoolean` 为布尔；`effectiveDateTime`、`issued` 为 ISO8601 日期时间（`YYYY-MM-DD`，可带 `Thh:mm[:ss[.f]]` 与 `Z`/`±hh:mm` 时区）。
+- Condition：`clinicalStatus`、`verificationStatus`、`code` 为 CodeableConcept 对象；`onsetDateTime` 为 ISO8601 日期时间；`recordedDate` 为 `YYYY-MM-DD` 格式的有效日期。
+- CodeableConcept：`coding` 为对象数组；每项的 `system`、`code`、`display` 为字符串，`userSelected` 为布尔。
+
+校验失败属于 `FhirValidationError`：message 含字段位置与唯一原因，stdout 为空，stderr 一行 JSON，退出码 `2`，不写审计文件。错误优先级：顶层结构与 `audit_context` 仍为 `InputError` 且最先；严格类型校验在既有资源校验之后、引用校验（`--check-references`）与 `term_maps` 校验之前，因此类型错误先于引用错误与 `TermMappingError`。与 `--audit-errors` 同用时按 `decision=rejected`、`phase=validation`、`status=400` 追加拒绝记录后再报原错；与 `--audit-chain` 同用时链式摘要规则不变；成功输出的字段与顺序不变。`--verify-audit` 与 `--strict-types` 同用直接返回 `InputError`，不读取标准输入、不追加审计。
 
 ## 成功输出
 
@@ -311,7 +326,7 @@ fhir-gateway --verify-audit --audit-file PATH
 | 错误类型 | 触发场景 |
 | --- | --- |
 | `InputError` | 标准输入不是合法 JSON、请求结构非法、缺少字段、`audit_context` 非法 |
-| `FhirValidationError` | 资源类型/id/status/编码不满足校验规则；开启 `--check-references` 时引用缺少本地目标、目标重复、`reference` 非法或形式不受支持 |
+| `FhirValidationError` | 资源类型/id/status/编码不满足校验规则；开启 `--check-references` 时引用缺少本地目标、目标重复、`reference` 非法或形式不受支持；开启 `--strict-types` 时已知字段类型、日期或 `value[x]` 基数不满足 FHIR R4 |
 | `TermMappingError` | 映射项字段非法，或同一源编码存在多个不同目标（transaction/batch 中降级为逐项 `processing`） |
 | `AuditWriteError` | 缺少 `--audit-file`、路径为目录、父目录不存在、无权限或追加写入不完整；链式模式下目标文件存在非链式行、摘要不匹配、重复 `audit_id`、缺字段或非对象行；此时 stdout 为空 |
 | `AuditReadError` | `--verify-audit` 时文件缺失、路径为目录、父目录不存在或读取失败 |
@@ -327,7 +342,7 @@ python3 test_fhir_gateway.py
 
 ## 状态
 
-已实现 `fhir-gateway`：资源校验、术语映射、审计留痕端到端可用，支持单资源与 FHIR R4 Bundle；transaction/batch Bundle 支持批量执行语义（逐项校验与映射、transaction-response/batch-response、全有或全无/逐项独立、逐项审计）；`--audit-chain` 提供基于 SHA-256 的审计完整性链，`--verify-audit` 支持离线复核；`--check-references` 提供可选的本地引用完整性校验（片段 contained 解析、非执行 Bundle 跨 entry 唯一解析、外部引用仅校验形式）；`--audit-errors` 提供可选的拒绝审计（rejected 记录、按阶段归类、链式兼容），含 118 个端到端测试。
+已实现 `fhir-gateway`：资源校验、术语映射、审计留痕端到端可用，支持单资源与 FHIR R4 Bundle；transaction/batch Bundle 支持批量执行语义（逐项校验与映射、transaction-response/batch-response、全有或全无/逐项独立、逐项审计）；`--audit-chain` 提供基于 SHA-256 的审计完整性链，`--verify-audit` 支持离线复核；`--check-references` 提供可选的本地引用完整性校验（片段 contained 解析、非执行 Bundle 跨 entry 唯一解析、外部引用仅校验形式）；`--audit-errors` 提供可选的拒绝审计（rejected 记录、按阶段归类、链式兼容）；`--strict-types` 提供可选的 FHIR R4 已知字段类型收紧（Patient/Observation/Condition 与 CodeableConcept 的字段形态、日期与 value[x] 基数，未知字段保留），含 143 个端到端测试。
 
 ## 约定
 

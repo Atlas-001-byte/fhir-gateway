@@ -2011,5 +2011,625 @@ class AuditErrorsTests(unittest.TestCase):
         self.assertEqual(err["type"], "AuditWriteError")
 
 
+STRICT_ARGS = ["--strict-types"]
+
+
+def run_strict(payload, audit_file, args=None, raw=None):
+    return run(payload, audit_file, args=STRICT_ARGS + (args or []), raw=raw)
+
+
+def strict_patient(**overrides):
+    resource = {"resourceType": "Patient", "id": "p1"}
+    resource.update(overrides)
+    return resource
+
+
+def strict_observation(**overrides):
+    resource = {
+        "resourceType": "Observation",
+        "id": "o1",
+        "status": "final",
+        "code": {"coding": [{"system": "s", "code": "c"}]},
+    }
+    resource.update(overrides)
+    return resource
+
+
+def strict_condition(**overrides):
+    resource = {
+        "resourceType": "Condition",
+        "id": "c1",
+        "clinicalStatus": {"coding": [{"system": "s", "code": "active"}]},
+    }
+    resource.update(overrides)
+    return resource
+
+
+class StrictTypesSuccessTests(unittest.TestCase):
+    def test_valid_patient_full_fields(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            resource = strict_patient(
+                active=True,
+                gender="female",
+                birthDate="1980-02-29",
+                name=[{"family": "Doe", "given": ["Jane"], "text": "Jane Doe"}],
+                telecom=[{"system": "phone", "value": "123", "rank": 1}],
+            )
+            proc = run_strict(base_request(resource=resource, term_maps=[]), audit_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            out = json.loads(proc.stdout)
+            self.assertEqual(out["resource"], resource)
+            self.assertEqual(
+                list(out.keys()),
+                ["status", "resource_type", "resource", "mappings", "audit"],
+            )
+
+    def test_valid_observation_value_choices(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            for resource in (
+                strict_observation(valueQuantity={"value": 1.5, "unit": "kg"}),
+                strict_observation(valueInteger=42),
+                strict_observation(valueString="normal"),
+                strict_observation(valueBoolean=True),
+                strict_observation(
+                    valueCodeableConcept={
+                        "coding": [
+                            {
+                                "system": "s",
+                                "code": "c",
+                                "display": "C",
+                                "userSelected": False,
+                            }
+                        ],
+                        "text": "concept",
+                    }
+                ),
+            ):
+                proc = run_strict(
+                    base_request(resource=resource, term_maps=[]), audit_file
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr + json.dumps(resource))
+
+    def test_valid_observation_datetimes_and_condition(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            obs = strict_observation(
+                effectiveDateTime="2026-10-03T10:00:00Z",
+                issued="2026-10-03T18:30:00.123+08:00",
+            )
+            self.assertEqual(
+                run_strict(base_request(resource=obs, term_maps=[]), audit_file).returncode,
+                0,
+            )
+            cond = strict_condition(
+                verificationStatus={"coding": [{"system": "s", "code": "confirmed"}]},
+                code={"coding": [{"system": "s", "code": "x"}]},
+                onsetDateTime="2026-10-03T10:00:00Z",
+                recordedDate="2026-10-03",
+            )
+            proc = run_strict(base_request(resource=cond, term_maps=[]), audit_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_unknown_fields_and_name_telecom_internals_preserved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            resource = strict_patient(
+                weird={"nested": [1, True, None]},
+                name=[{"family": 1, "given": "x", "unknown_field": {"k": 0}}],
+                telecom=[{"value": 1}],
+            )
+            proc = run_strict(base_request(resource=resource, term_maps=[]), audit_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(json.loads(proc.stdout)["resource"], resource)
+
+    def test_optional_codeable_concept_coding_may_be_empty_or_absent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            cond = strict_condition(
+                code={"coding": [], "text": "free text"},
+                verificationStatus={"text": "confirmed"},
+            )
+            proc = run_strict(base_request(resource=cond, term_maps=[]), audit_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_flag_off_keeps_baseline_permissive_behavior(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            for resource in (
+                strict_patient(active=1, gender="X", birthDate=1980, name={}),
+                strict_observation(valueInteger="5", valueString=1),
+                strict_condition(verificationStatus="not-an-object"),
+            ):
+                proc = run(base_request(resource=resource, term_maps=[]), audit_file)
+                self.assertEqual(proc.returncode, 0, proc.stderr + json.dumps(resource))
+
+    def test_non_executable_bundle_strict_success(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            req = bundle_request(
+                [
+                    {"resource": strict_patient(active=True)},
+                    {"resource": strict_observation(valueInteger=3)},
+                    {"resource": strict_condition(recordedDate="2026-10-03")},
+                ]
+            )
+            proc = run_strict(req, audit_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(json.loads(proc.stdout)["resource_type"], "Bundle")
+
+    def test_transaction_and_batch_strict_success(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            entries = [
+                tx_entry(strict_patient(active=True)),
+                tx_entry(strict_observation(effectiveDateTime="2026-10-03T10:00:00Z")),
+            ]
+            for bundle_type in ("transaction", "batch"):
+                proc = run_strict(
+                    executable_request(entries, bundle_type=bundle_type), audit_file
+                )
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                out = json.loads(proc.stdout)
+                self.assertEqual(out["status"], 200)
+                self.assertEqual(
+                    [e["status"] for e in out["resource"]["entry"]], [200, 200]
+                )
+
+
+class StrictTypesPatientFailureTests(unittest.TestCase):
+    def assert_fhir_error(self, proc, *parts):
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(proc.stdout, "")
+        err = json.loads(proc.stderr)["error"]
+        self.assertEqual(err["type"], "FhirValidationError")
+        message = err["message"]
+        for part in parts:
+            self.assertIn(part, message)
+        return message
+
+    def strict_fail(self, resource, *parts, args=None):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            proc = run_strict(
+                base_request(resource=resource, term_maps=[]),
+                audit_file,
+                args=args,
+            )
+            self.assertFalse(os.path.exists(audit_file))
+            return self.assert_fhir_error(proc, *parts)
+
+    def test_active_wrong_types(self):
+        self.strict_fail(strict_patient(active=1), "Patient.active", "布尔")
+        self.strict_fail(strict_patient(active="true"), "Patient.active", "布尔")
+        self.strict_fail(strict_patient(active=None), "Patient.active", "null")
+
+    def test_gender_invalid(self):
+        self.strict_fail(strict_patient(gender="MALE"), "Patient.gender")
+        self.strict_fail(strict_patient(gender=1), "Patient.gender")
+        self.strict_fail(strict_patient(gender=None), "Patient.gender")
+
+    def test_birth_date_invalid(self):
+        self.strict_fail(strict_patient(birthDate=19800229), "Patient.birthDate", "字符串")
+        self.strict_fail(strict_patient(birthDate="1980-13-01"), "Patient.birthDate")
+        self.strict_fail(strict_patient(birthDate="1980/02/29"), "Patient.birthDate")
+        self.strict_fail(strict_patient(birthDate="1981-02-29"), "Patient.birthDate")
+        self.strict_fail(strict_patient(birthDate=None), "Patient.birthDate", "null")
+
+    def test_name_and_telecom_shape(self):
+        self.strict_fail(strict_patient(name={"family": "Doe"}), "Patient.name", "数组")
+        self.strict_fail(strict_patient(name=["Doe"]), "Patient.name[0]", "对象")
+        self.strict_fail(
+            strict_patient(telecom="phone"),
+            "Patient.telecom",
+            "数组",
+        )
+        self.strict_fail(
+            strict_patient(telecom=[1]), "Patient.telecom[0]", "对象"
+        )
+
+
+class StrictTypesObservationFailureTests(unittest.TestCase):
+    def strict_fail(self, resource, *parts):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            proc = run_strict(
+                base_request(resource=resource, term_maps=[]), audit_file
+            )
+            self.assertEqual(proc.returncode, 2)
+            self.assertEqual(proc.stdout, "")
+            self.assertFalse(os.path.exists(audit_file))
+            message = json.loads(proc.stderr)["error"]["message"]
+            for part in parts:
+                self.assertIn(part, message)
+            return message
+
+    def test_codeable_concept_shape(self):
+        # 首个 coding 的 system/code 类型错误先被基线 _primary_coding 拦截；
+        # 严格收紧对后续 coding 元素与 display/userSelected/text 生效。
+        self.strict_fail(
+            strict_observation(code={"coding": "x"}), "Observation.code.coding", "数组"
+        )
+        self.strict_fail(
+            strict_observation(code={"coding": ["x"]}),
+            "Observation.code.coding[0]",
+            "对象",
+        )
+        self.strict_fail(
+            strict_observation(
+                code={
+                    "coding": [
+                        {"system": "s", "code": "c"},
+                        {"system": 1, "code": "c2"},
+                    ]
+                }
+            ),
+            "Observation.code.coding[1].system",
+            "字符串",
+        )
+        self.strict_fail(
+            strict_observation(
+                code={"coding": [{"system": "s", "code": "c", "display": 5}]}
+            ),
+            "Observation.code.coding[0].display",
+            "字符串",
+        )
+        self.strict_fail(
+            strict_observation(
+                code={
+                    "coding": [{"system": "s", "code": "c", "userSelected": "yes"}]
+                }
+            ),
+            "Observation.code.coding[0].userSelected",
+            "布尔",
+        )
+        self.strict_fail(
+            strict_observation(code={"coding": [{"system": "s", "code": "c"}], "text": 9}),
+            "Observation.code.text",
+            "字符串",
+        )
+
+    def test_value_choices_wrong_types(self):
+        self.strict_fail(
+            strict_observation(valueQuantity="5"), "Observation.valueQuantity", "对象"
+        )
+        self.strict_fail(
+            strict_observation(valueQuantity=None), "Observation.valueQuantity", "null"
+        )
+        self.strict_fail(
+            strict_observation(valueInteger=True), "Observation.valueInteger", "整数"
+        )
+        self.strict_fail(
+            strict_observation(valueInteger=1.5), "Observation.valueInteger", "整数"
+        )
+        self.strict_fail(
+            strict_observation(valueInteger="5"), "Observation.valueInteger", "整数"
+        )
+        self.strict_fail(
+            strict_observation(valueString=5), "Observation.valueString", "字符串"
+        )
+        self.strict_fail(
+            strict_observation(valueBoolean=0), "Observation.valueBoolean", "布尔"
+        )
+        self.strict_fail(
+            strict_observation(valueBoolean="true"),
+            "Observation.valueBoolean",
+            "布尔",
+        )
+
+    def test_multiple_value_choices_rejected(self):
+        message = self.strict_fail(
+            strict_observation(valueString="x", valueQuantity={"value": 1}),
+            "value[x]",
+        )
+        self.assertIn("valueString", message)
+        self.assertIn("valueQuantity", message)
+
+    def test_value_codeable_concept_is_part_of_choice(self):
+        message = self.strict_fail(
+            strict_observation(
+                valueCodeableConcept={"coding": [{"system": "s", "code": "c"}]},
+                valueBoolean=True,
+            ),
+            "value[x]",
+        )
+        self.assertIn("valueCodeableConcept", message)
+        self.assertIn("valueBoolean", message)
+
+    def test_value_codeable_concept_shape(self):
+        self.strict_fail(
+            strict_observation(valueCodeableConcept="x"),
+            "Observation.valueCodeableConcept",
+            "对象",
+        )
+        self.strict_fail(
+            strict_observation(
+                valueCodeableConcept={"coding": [{"system": "s", "code": None}]}
+            ),
+            "Observation.valueCodeableConcept.coding[0].code",
+        )
+        self.strict_fail(
+            strict_observation(
+                valueCodeableConcept={
+                    "coding": [{"system": "s", "code": "c", "userSelected": 1}]
+                }
+            ),
+            "Observation.valueCodeableConcept.coding[0].userSelected",
+            "布尔",
+        )
+
+    def test_datetimes_invalid(self):
+        self.strict_fail(
+            strict_observation(effectiveDateTime="2026-10-03"),
+            "Observation.effectiveDateTime",
+        )
+        self.strict_fail(
+            strict_observation(effectiveDateTime="not-a-date"),
+            "Observation.effectiveDateTime",
+        )
+        self.strict_fail(
+            strict_observation(effectiveDateTime="2026-02-30T00:00:00Z"),
+            "Observation.effectiveDateTime",
+        )
+        self.strict_fail(
+            strict_observation(effectiveDateTime=20261003),
+            "Observation.effectiveDateTime",
+            "字符串",
+        )
+        self.strict_fail(strict_observation(issued=123), "Observation.issued", "字符串")
+        self.strict_fail(
+            strict_observation(issued="2026-10-03"), "Observation.issued"
+        )
+
+
+class StrictTypesConditionFailureTests(unittest.TestCase):
+    def strict_fail(self, resource, *parts):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            proc = run_strict(
+                base_request(resource=resource, term_maps=[]), audit_file
+            )
+            self.assertEqual(proc.returncode, 2)
+            self.assertEqual(proc.stdout, "")
+            message = json.loads(proc.stderr)["error"]["message"]
+            for part in parts:
+                self.assertIn(part, message)
+
+    def test_codeable_concepts(self):
+        self.strict_fail(
+            strict_condition(verificationStatus="confirmed"),
+            "Condition.verificationStatus",
+            "对象",
+        )
+        self.strict_fail(
+            strict_condition(code=[]), "Condition.code", "对象"
+        )
+        self.strict_fail(
+            strict_condition(
+                verificationStatus={"coding": [{"system": "s", "code": True}]}
+            ),
+            "Condition.verificationStatus.coding[0].code",
+            "字符串",
+        )
+
+    def test_onset_and_recorded_dates(self):
+        self.strict_fail(
+            strict_condition(onsetDateTime=5), "Condition.onsetDateTime", "字符串"
+        )
+        self.strict_fail(
+            strict_condition(onsetDateTime="2026-10-03"), "Condition.onsetDateTime"
+        )
+        self.strict_fail(
+            strict_condition(recordedDate="2026-10-03T00:00:00Z"),
+            "Condition.recordedDate",
+        )
+        self.strict_fail(
+            strict_condition(recordedDate="2026-02-30"), "Condition.recordedDate"
+        )
+
+
+class StrictTypesBundleFailureTests(unittest.TestCase):
+    def test_non_executable_bundle_entry_failure_has_location(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            req = bundle_request(
+                [
+                    {"resource": strict_patient()},
+                    {"resource": strict_observation(valueInteger="bad")},
+                ]
+            )
+            proc = run_strict(req, audit_file)
+            self.assertEqual(proc.returncode, 2)
+            self.assertEqual(proc.stdout, "")
+            message = json.loads(proc.stderr)["error"]["message"]
+            self.assertIn("Bundle.entry[1].resource.valueInteger", message)
+            self.assertFalse(os.path.exists(audit_file))
+
+    def test_transaction_strict_failure_is_processing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            entries = [
+                tx_entry(strict_patient()),
+                tx_entry(strict_observation(valueQuantity=5)),
+            ]
+            proc = run_strict(executable_request(entries), audit_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            out = json.loads(proc.stdout)
+            self.assertEqual(out["status"], 400)
+            self.assertEqual(
+                [e["status"] for e in out["resource"]["entry"]], [200, 400]
+            )
+            issue = out["resource"]["entry"][1]["outcome"]["issue"][0]
+            self.assertEqual(issue["code"], "processing")
+            self.assertEqual(issue["expression"], "Bundle.entry[1].resource")
+            self.assertIn("valueQuantity", issue["diagnostics"])
+            audit_entry = out["audit"]["entries"][1]
+            self.assertEqual(audit_entry["phase"], "validation")
+            self.assertEqual(audit_entry["issue_code"], "processing")
+
+    def test_batch_strict_failure_independent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            entries = [
+                tx_entry(strict_patient(active="yes")),
+                tx_entry(strict_patient()),
+            ]
+            proc = run_strict(
+                executable_request(entries, bundle_type="batch"), audit_file
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            out = json.loads(proc.stdout)
+            self.assertEqual(out["status"], 200)
+            self.assertEqual(
+                [e["status"] for e in out["resource"]["entry"]], [400, 200]
+            )
+            self.assertEqual(
+                out["resource"]["entry"][0]["outcome"]["issue"][0]["code"],
+                "processing",
+            )
+
+    def test_request_invalid_precedes_strict_validation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            entries = [
+                {
+                    "request": {"method": "POST", "url": "Observation/o1"},
+                    "resource": strict_patient(active=1),
+                }
+            ]
+            proc = run_strict(executable_request(entries), audit_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            issue = json.loads(proc.stdout)["resource"]["entry"][0]["outcome"]["issue"][0]
+            self.assertEqual(issue["code"], "invalid")
+
+    def test_strict_validation_precedes_mapping_in_entry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            req = executable_request([tx_entry(strict_observation(valueInteger="x"))])
+            req["term_maps"] = [{"system": "s"}]
+            proc = run_strict(req, audit_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            out = json.loads(proc.stdout)
+            audit_entry = out["audit"]["entries"][0]
+            self.assertEqual(audit_entry["phase"], "validation")
+            self.assertEqual(audit_entry["issue_code"], "processing")
+
+    def test_flag_off_bundle_keeps_baseline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            req = bundle_request([{"resource": strict_patient(active=1)}])
+            proc = run(req, audit_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+
+class StrictTypesPrecedenceAndComboTests(unittest.TestCase):
+    def test_type_check_precedes_reference_check(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            resource = strict_patient(
+                active="yes",
+                generalPractitioner={"reference": "#missing"},
+            )
+            req = base_request(resource=resource, term_maps=[])
+            proc = run_strict(req, audit_file, args=["--check-references"])
+            self.assertEqual(proc.returncode, 2)
+            message = json.loads(proc.stderr)["error"]["message"]
+            self.assertIn("Patient.active", message)
+
+    def test_reference_check_precedes_term_mapping(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            resource = strict_observation(
+                subject={"reference": "#missing"},
+            )
+            req = base_request(
+                resource=resource, term_maps=[{"system": "s"}]
+            )
+            proc = run_strict(req, audit_file, args=["--check-references"])
+            self.assertEqual(proc.returncode, 2)
+            self.assertEqual(
+                json.loads(proc.stderr)["error"]["type"], "FhirValidationError"
+            )
+
+    def test_input_error_precedes_everything(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            # audit_context 非法（InputError）先于资源严格失败、引用失败与
+            # term_maps 的 TermMappingError，即使所有开关同开。
+            req = base_request(
+                resource=strict_patient(
+                    active="bad",
+                    generalPractitioner={"reference": "#missing"},
+                ),
+                term_maps=[{"system": "s"}],
+            )
+            req["audit_context"] = {"request_id": "r", "actor": "", "recorded_at": "t"}
+            proc = run_strict(req, audit_file, args=["--check-references"])
+            self.assertEqual(proc.returncode, 2)
+            self.assertEqual(
+                json.loads(proc.stderr)["error"]["type"], "InputError"
+            )
+            self.assertFalse(os.path.exists(audit_file))
+
+    def test_audit_errors_writes_rejected_then_reports(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            req = base_request(resource=strict_patient(gender="x"), term_maps=[])
+            proc = run_strict(req, audit_file, args=["--audit-errors"])
+            self.assertEqual(proc.returncode, 2)
+            self.assertEqual(proc.stdout, "")
+            err = json.loads(proc.stderr)["error"]
+            self.assertEqual(err["type"], "FhirValidationError")
+            self.assertIn("Patient.gender", err["message"])
+            (record,) = read_audit_lines(audit_file)
+            self.assertEqual(record["decision"], "rejected")
+            self.assertEqual(record["phase"], "validation")
+            self.assertEqual(record["status"], 400)
+            self.assertEqual(record["error_type"], "FhirValidationError")
+            self.assertEqual(record["request_id"], req["audit_context"]["request_id"])
+
+    def test_audit_chain_with_strict_types(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            ok = run_strict(
+                base_request(resource=strict_patient()),
+                audit_file,
+                args=["--audit-chain"],
+            )
+            self.assertEqual(ok.returncode, 0, ok.stderr)
+            bad = run_strict(
+                base_request(resource=strict_patient(active=1), term_maps=[]),
+                audit_file,
+                args=["--audit-chain", "--audit-errors"],
+            )
+            self.assertEqual(bad.returncode, 2, bad.stderr)
+            proc = run_verify(audit_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(json.loads(proc.stdout)["line_count"], 2)
+
+    def test_verify_audit_with_strict_types_is_input_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    GATEWAY,
+                    "--strict-types",
+                    "--verify-audit",
+                    "--audit-file",
+                    audit_file,
+                ],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(result.stdout, "")
+            err = json.loads(result.stderr)["error"]
+            self.assertEqual(err["type"], "InputError")
+            self.assertFalse(os.path.exists(audit_file))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -1733,5 +1733,323 @@ class ReferenceCheckTests(unittest.TestCase):
             self.assertEqual(json.loads(result.stdout)["line_count"], 1)
 
 
+AUDIT_ERRORS_ARGS = ["--audit-errors"]
+
+
+def run_audit_errors(payload, audit_file, args=None, raw=None):
+    return run(payload, audit_file, args=AUDIT_ERRORS_ARGS + (args or []), raw=raw)
+
+
+class AuditErrorsTests(unittest.TestCase):
+    REJECT_FIELDS = {
+        "request_id",
+        "actor",
+        "recorded_at",
+        "decision",
+        "audit_id",
+        "error_type",
+        "phase",
+        "status",
+    }
+
+    def _read_lines(self, path):
+        with open(path, encoding="utf-8") as fh:
+            return [json.loads(line) for line in fh if line.strip()]
+
+    def assert_rejection(self, proc, audit_file, error_type, phase,
+                         request_id="req-1", actor="dr-house",
+                         recorded_at="2026-10-03T10:00:00Z"):
+        """错误输出不变，且审计文件恰好多一条规范拒绝记录。"""
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(proc.stdout, "")
+        self.assertEqual(proc.stderr.count("\n"), 1)
+        err = json.loads(proc.stderr)
+        self.assertEqual(err["error"]["type"], error_type)
+        self.assertTrue(err["error"]["message"])
+
+        lines = self._read_lines(audit_file)
+        self.assertEqual(len(lines), 1)
+        record = lines[0]
+        # 字段恰好为规定的八项，不含 resource/term_maps/引用/message/正文。
+        self.assertEqual(set(record), self.REJECT_FIELDS)
+        self.assertEqual(
+            list(record),
+            [
+                "request_id",
+                "actor",
+                "recorded_at",
+                "decision",
+                "audit_id",
+                "error_type",
+                "phase",
+                "status",
+            ],
+        )
+        self.assertEqual(record["request_id"], request_id)
+        self.assertEqual(record["actor"], actor)
+        self.assertEqual(record["recorded_at"], recorded_at)
+        self.assertEqual(record["decision"], "rejected")
+        self.assertTrue(record["audit_id"])
+        self.assertEqual(record["error_type"], error_type)
+        self.assertEqual(record["phase"], phase)
+        self.assertEqual(record["status"], 400)
+        return record
+
+    def test_invalid_json_phase_request_null_context(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            proc = run_audit_errors(None, audit_file, raw="{not json")
+            # JSON 无法解析，audit_context 三项为 null。
+            self.assert_rejection(
+                proc, audit_file, "InputError", "request",
+                request_id=None, actor=None, recorded_at=None,
+            )
+
+    def test_request_not_object_phase_request(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            proc = run_audit_errors(None, audit_file, raw="[1,2,3]")
+            self.assert_rejection(
+                proc, audit_file, "InputError", "request",
+                request_id=None, actor=None, recorded_at=None,
+            )
+
+    def test_missing_field_keeps_valid_audit_context(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            proc = run_audit_errors({"resource": {}}, audit_file)
+            # 请求结构失败归 request；audit_context 缺失时三项为 null。
+            self.assert_rejection(
+                proc, audit_file, "InputError", "request",
+                request_id=None, actor=None, recorded_at=None,
+            )
+
+    def test_resource_error_keeps_audit_context(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            req = base_request(resource={"resourceType": "Medication", "id": "x"})
+            proc = run_audit_errors(req, audit_file)
+            self.assert_rejection(proc, audit_file, "FhirValidationError", "validation")
+
+    def test_audit_context_invalid_nulls_all_three(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            req = base_request()
+            req["audit_context"]["actor"] = ""
+            proc = run_audit_errors(req, audit_file)
+            # 三值任一非非空字符串，三项均为 null。
+            self.assert_rejection(
+                proc, audit_file, "InputError", "request",
+                request_id=None, actor=None, recorded_at=None,
+            )
+
+    def test_term_mapping_error_phase_mapping(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            req = base_request()
+            conflict = dict(req["term_maps"][0])
+            conflict["target_code"] = "9999999"
+            req["term_maps"].append(conflict)
+            proc = run_audit_errors(req, audit_file)
+            self.assert_rejection(proc, audit_file, "TermMappingError", "mapping")
+
+    def test_reference_error_phase_validation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            resource = {
+                "resourceType": "Patient",
+                "id": "pat-1",
+                "managingOrganization": {"reference": "#ghost"},
+            }
+            req = base_request(resource=resource, term_maps=[])
+            proc = run_audit_errors(req, audit_file, args=["--check-references"])
+            self.assert_rejection(proc, audit_file, "FhirValidationError", "validation")
+
+    def test_rejection_record_privacy_boundary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            req = base_request()
+            req["resource"]["status"] = "draft"
+            proc = run_audit_errors(req, audit_file)
+            self.assertEqual(proc.returncode, 2)
+            with open(audit_file, encoding="utf-8") as fh:
+                raw = fh.read()
+            # 不写入资源、term_maps、引用、message 或正文内容。
+            self.assertNotIn("obs-1", raw)
+            self.assertNotIn("loinc", raw)
+            self.assertNotIn("message", raw)
+            self.assertNotIn("draft", raw)
+
+    def test_success_path_unchanged_with_flag(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            proc = run_audit_errors(base_request(), audit_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            out = json.loads(proc.stdout)
+            self.assertEqual(
+                list(out.keys()),
+                ["status", "resource_type", "resource", "mappings", "audit"],
+            )
+            # 成功审计记录字段不新增。
+            self.assertEqual(
+                set(out["audit"]),
+                {"request_id", "actor", "recorded_at", "decision", "audit_id"},
+            )
+            self.assertEqual(out["audit"]["decision"], "accepted")
+            lines = self._read_lines(audit_file)
+            self.assertEqual(len(lines), 1)
+            self.assertEqual(lines[0], out["audit"])
+
+    def test_accepted_then_rejected_accumulate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            proc = run_audit_errors(base_request(), audit_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            req = base_request()
+            req["resource"]["status"] = "draft"
+            proc = run_audit_errors(req, audit_file)
+            self.assertEqual(proc.returncode, 2)
+            lines = self._read_lines(audit_file)
+            self.assertEqual(len(lines), 2)
+            self.assertEqual(lines[0]["decision"], "accepted")
+            self.assertEqual(lines[1]["decision"], "rejected")
+            self.assertNotEqual(lines[0]["audit_id"], lines[1]["audit_id"])
+
+    def test_audit_write_error_not_recorded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            nested = os.path.join(tmp, "missing-dir", "audit.jsonl")
+            proc = run_audit_errors(base_request(), nested)
+            self.assertEqual(proc.returncode, 2)
+            self.assertEqual(proc.stdout, "")
+            err = json.loads(proc.stderr)
+            self.assertEqual(err["error"]["type"], "AuditWriteError")
+            self.assertFalse(os.path.exists(nested))
+
+    def test_rejection_append_failure_becomes_audit_write_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # 审计路径是目录：原 FhirValidationError 被 AuditWriteError 取代。
+            req = base_request()
+            req["resource"]["status"] = "draft"
+            proc = run_audit_errors(req, tmp)
+            self.assertEqual(proc.returncode, 2)
+            self.assertEqual(proc.stdout, "")
+            self.assertEqual(proc.stderr.count("\n"), 1)
+            err = json.loads(proc.stderr)
+            self.assertEqual(err["error"]["type"], "AuditWriteError")
+
+    def test_missing_audit_file_arg_unchanged(self):
+        proc = run(base_request(), args=AUDIT_ERRORS_ARGS)
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(proc.stdout, "")
+        err = json.loads(proc.stderr)
+        self.assertEqual(err["error"]["type"], "AuditWriteError")
+
+    def test_executable_entry_failures_add_no_rejection_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            entries = [
+                tx_entry(patient_resource("pat-1")),
+                tx_entry(patient_resource("pat-2"), method="DELETE"),
+            ]
+            proc = run_audit_errors(executable_request(entries), audit_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            out = json.loads(proc.stdout)
+            self.assertEqual(out["status"], 400)
+            self.assertEqual(out["audit"]["decision"], "accepted")
+            self.assertEqual(out["audit"]["entry_failed"], 1)
+            # 仅既有的一条批量审计，不另加拒绝行。
+            lines = self._read_lines(audit_file)
+            self.assertEqual(len(lines), 1)
+            self.assertEqual(lines[0], out["audit"])
+
+    def test_executable_gateway_level_error_recorded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            req = executable_request([tx_entry(patient_resource())])
+            del req["resource"]["id"]
+            proc = run_audit_errors(req, audit_file)
+            self.assert_rejection(proc, audit_file, "FhirValidationError", "validation")
+
+    def test_chained_rejection_record_verifies(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            proc = run_audit_errors(base_request(), audit_file, args=["--audit-chain"])
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            req = base_request()
+            req["resource"]["status"] = "draft"
+            proc = run_audit_errors(req, audit_file, args=["--audit-chain"])
+            self.assertEqual(proc.returncode, 2)
+            self.assertEqual(proc.stdout, "")
+
+            lines = self._read_lines(audit_file)
+            self.assertEqual(len(lines), 2)
+            self.assertEqual(lines[0]["decision"], "accepted")
+            record = lines[1]
+            self.assertEqual(record["decision"], "rejected")
+            self.assertEqual(record["phase"], "validation")
+            self.assertRegex(record["audit_digest"], r"^[0-9a-f]{64}$")
+            # 链式落盘为规范 JSON，可独立复算并被 --verify-audit 接受。
+            prev = chain_digest(GENESIS_DIGEST, lines[0])
+            self.assertEqual(record["audit_digest"], chain_digest(prev, record))
+            result = run_verify(audit_file)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout)["line_count"], 2)
+
+    def test_chained_rejection_on_broken_chain_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            write_lines(audit_file, [json.dumps({"audit_id": "old", "decision": "x"})])
+            with open(audit_file, "rb") as fh:
+                before = fh.read()
+            req = base_request()
+            req["resource"]["status"] = "draft"
+            proc = run_audit_errors(req, audit_file, args=["--audit-chain"])
+            self.assertEqual(proc.returncode, 2)
+            self.assertEqual(proc.stdout, "")
+            err = json.loads(proc.stderr)
+            self.assertEqual(err["error"]["type"], "AuditWriteError")
+            # 原文件不变且不再记录。
+            with open(audit_file, "rb") as fh:
+                self.assertEqual(fh.read(), before)
+
+    def test_verify_audit_with_audit_errors_is_input_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            proc = run_chain(base_request(), audit_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    GATEWAY,
+                    "--verify-audit",
+                    "--audit-errors",
+                    "--audit-file",
+                    audit_file,
+                ],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(result.stdout, "")
+            err = json.loads(result.stderr)
+            self.assertEqual(err["error"]["type"], "InputError")
+            # 校验模式只读：不追加任何记录。
+            self.assertEqual(len(self._read_lines(audit_file)), 1)
+
+    def test_flag_off_behavior_unchanged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            req = base_request()
+            req["resource"]["status"] = "draft"
+            proc = run(req, audit_file)
+            self.assertEqual(proc.returncode, 2)
+            self.assertEqual(proc.stdout, "")
+            self.assertEqual(json.loads(proc.stderr)["error"]["type"],
+                             "FhirValidationError")
+            self.assertFalse(os.path.exists(audit_file))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -17,12 +17,14 @@
 fhir-gateway --audit-file PATH < request.json
 fhir-gateway --audit-chain --audit-file PATH < request.json
 fhir-gateway --check-references --audit-file PATH < request.json
+fhir-gateway --audit-errors --audit-file PATH < request.json
 fhir-gateway --verify-audit --audit-file PATH
 ```
 
 - `--audit-file PATH`（必需）：审计 JSON Lines 文件；文件不存在则创建，已存在则保留旧行并追加。
 - `--audit-chain`（可选）：为审计增加可离线复核的完整性链；不开启时行为完全不变。
 - `--check-references`（可选）：开启本地引用完整性校验；不开启时解析、校验、映射、输出与审计行为完全不变。
+- `--audit-errors`（可选）：开启拒绝审计，仅用于请求处理，须与 `--audit-file` 同用；不开启时行为完全不变。
 - `--verify-audit`（可选）：只校验链式文件，不读取标准输入。
 - 请求 JSON 从标准输入读取（校验模式除外）。
 
@@ -281,9 +283,42 @@ fhir-gateway --verify-audit --audit-file PATH
 - 文件缺失、路径为目录、父目录不存在或读取失败返回 `AuditReadError`。
 - 两类校验错误均 **stdout 为空**、stderr 一行 JSON、退出码 `2`。
 
+## 拒绝审计（--audit-errors）
+
+`--audit-errors` 为可选开关，仅用于请求处理，须与 `--audit-file` 同用。不开启时 stdout、stderr、退出码、审计记录、成功输出字段、批量执行结果以及缺少 `--audit-file` 时的 `AuditWriteError` 行为完全不变。
+
+开启后，请求处理返回非 `AuditWriteError` 的受控错误时，在返回错误前向 `--audit-file` 追加一条拒绝记录；错误输出本身不变（stdout 为空、stderr 一行 JSON、退出码 `2`、`error.type` 与 message 均不变）。错误阶段归类：
+
+- JSON 解析、根节点、请求结构、`audit_context` 失败 → `request`（`InputError`）。
+- FHIR 资源及 `--check-references` 引用失败 → `validation`（`FhirValidationError`）。
+- `term_maps` 字段或同源冲突失败 → `mapping`（`TermMappingError`）。
+
+拒绝记录字段（顺序固定，此外不写入 resource、term_maps、引用、message 或请求正文）：
+
+```json
+{
+  "request_id": "req-1",
+  "actor": "dr-house",
+  "recorded_at": "2026-10-03T10:00:00Z",
+  "decision": "rejected",
+  "audit_id": "非空随机ID",
+  "error_type": "FhirValidationError",
+  "phase": "validation",
+  "status": 400
+}
+```
+
+- `decision` 恒为 `rejected`，`status` 恒为 `400`，`audit_id` 为非空随机 ID，`error_type` 与 stderr 中的 `error.type` 相同。
+- `audit_context` 的 `request_id`、`actor`、`recorded_at` 三值均为非空字符串时才保留，否则三项均为 `null`（例如请求不是合法 JSON 时）。
+- `AuditWriteError`（含缺少 `--audit-file`）不产生拒绝记录。
+- transaction/batch 的 entry 级 request/validation/mapping 失败沿用现有响应 Bundle、整体状态、审计 `entries` 与退出码，不另加拒绝行；网关级错误（如 Bundle 缺 `id`）仍按上表记录。
+- 启用 `--audit-chain` 时拒绝记录沿用规范 JSON 与 SHA-256 链（含 `audit_digest`，可被 `--verify-audit` 复核）；链不合法、目标不可写或追加不完整统一返回 `AuditWriteError`（stderr 一行 JSON、退出码 `2`），原文件不变且不再记录。
+- `--verify-audit` 仍只读、不读标准输入、不追加；与 `--audit-errors` 同用直接返回 `InputError`。
+- 成功路径、既有 JSON Lines 内容与审计隐私边界不变：拒绝记录同样不含资源正文、患者标识或术语映射原文。
+
 ## 错误输出
 
-任意受控错误：**stdout 为空**，stderr 一行 JSON，退出码 `2`，且**不写审计文件**：
+任意受控错误：**stdout 为空**，stderr 一行 JSON，退出码 `2`，且**不写审计文件**（开启 `--audit-errors` 时非 `AuditWriteError` 会先追加一条拒绝记录，见上节）：
 
 ```json
 {"error": {"type": "InputError", "message": "非空错误信息"}}
@@ -308,7 +343,7 @@ python3 test_fhir_gateway.py
 
 ## 状态
 
-已实现 `fhir-gateway`：资源校验、术语映射、审计留痕端到端可用，支持单资源与 FHIR R4 Bundle；transaction/batch Bundle 支持批量执行语义（逐项校验与映射、transaction-response/batch-response、全有或全无/逐项独立、逐项审计）；`--audit-chain` 提供基于 SHA-256 的审计完整性链，`--verify-audit` 支持离线复核；`--check-references` 提供可选的本地引用完整性校验（片段 contained 解析、非执行 Bundle 跨 entry 唯一解析、外部引用仅校验形式），含 103 个端到端测试。
+已实现 `fhir-gateway`：资源校验、术语映射、审计留痕端到端可用，支持单资源与 FHIR R4 Bundle；transaction/batch Bundle 支持批量执行语义（逐项校验与映射、transaction-response/batch-response、全有或全无/逐项独立、逐项审计）；`--audit-chain` 提供基于 SHA-256 的审计完整性链，`--verify-audit` 支持离线复核；`--check-references` 提供可选的本地引用完整性校验（片段 contained 解析、非执行 Bundle 跨 entry 唯一解析、外部引用仅校验形式）；`--audit-errors` 提供可选拒绝审计（按 request/validation/mapping 阶段记录拒绝原因类型，链式模式可复核），含 122 个端到端测试。
 
 ## 约定
 

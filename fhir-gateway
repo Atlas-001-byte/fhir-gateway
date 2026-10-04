@@ -4,6 +4,7 @@
 用法:
     fhir-gateway --audit-file PATH < request.json
     fhir-gateway --audit-chain --audit-file PATH < request.json
+    fhir-gateway --check-references --audit-file PATH < request.json
     fhir-gateway --verify-audit --audit-file PATH
 
 仅使用 Python 标准库，从零实现，不依赖任何外部 FHIR/术语库。
@@ -15,6 +16,9 @@ type 为 transaction/batch 的 Bundle 走批量执行语义：按 entry 顺序�
 
 --audit-chain 开启后审计行增加 audit_digest（SHA-256 完整性链，可离线复核），
 stdout 与落盘一致；--verify-audit 仅校验链式文件，不读取标准输入。
+--check-references 开启本地引用完整性校验（#id 查同资源 contained，非执行
+Bundle 的 ResourceType/id 必须在 entry.resource 中唯一命中；单资源相对引用
+与 http(s):// 完整 URL 视为外部引用，仅校验形式）；不开启时行为完全不变。
 """
 
 import hashlib
@@ -176,6 +180,148 @@ def validate_bundle(bundle):
                 raise FhirValidationError("%s 缺少 resource" % label)
             # entry 内复用同一套 Patient/Observation/Condition 校验。
             validate_resource(entry["resource"])
+
+
+# 外部完整 URL 仅接受此前缀。
+EXTERNAL_URL_PREFIXES = ("http://", "https://")
+
+
+def _contained_ids(resource):
+    """收集同一顶层资源 contained 中各项的非空字符串 id。"""
+    contained = resource.get("contained")
+    ids = set()
+    if isinstance(contained, list):
+        for item in contained:
+            if isinstance(item, dict) and _is_nonempty_str(item.get("id")):
+                ids.add(item["id"])
+    return ids
+
+
+def _check_reference_value(value, contained_ids, bundle_index):
+    """校验单个 reference 字段值；bundle_index 为 None 时相对引用仅校验格式。"""
+    quoted = json.dumps(value, ensure_ascii=False)
+    if not isinstance(value, str):
+        raise FhirValidationError(
+            "reference 只接受非空字符串，引用值 %s 的形式不受支持" % quoted
+        )
+    if value == "":
+        raise FhirValidationError(
+            "reference 只接受非空字符串，引用值 %s 非法（空字符串）" % quoted
+        )
+
+    if value.startswith("#"):
+        fragment = value[1:]
+        if fragment == "":
+            raise FhirValidationError(
+                "引用值 %s 非法：# 后缺少 id" % quoted
+            )
+        if fragment not in contained_ids:
+            raise FhirValidationError(
+                "引用 %s 缺少本地目标：同一顶层资源的 contained 中"
+                "不存在 id 为 %s 的资源"
+                % (quoted, json.dumps(fragment, ensure_ascii=False))
+            )
+        return
+
+    if value.startswith(EXTERNAL_URL_PREFIXES):
+        # 完整 URL 为外部引用，目标无需存在。
+        return
+
+    segments = value.split("/")
+    if len(segments) != 2 or segments[0] == "" or segments[1] == "":
+        raise FhirValidationError(
+            "引用 %s 形式不受支持：仅支持 #id、ResourceType/id"
+            " 与 http:// 或 https:// 开头的完整 URL" % quoted
+        )
+
+    resource_type, resource_id = segments
+    if bundle_index is None:
+        # 单资源中的 ResourceType/id 是外部引用，仅校验格式，目标无需存在。
+        return
+
+    count = bundle_index.get((resource_type, resource_id), 0)
+    if count == 0:
+        raise FhirValidationError(
+            "相对引用 %s 缺少本地目标：Bundle.entry.resource 中不存在"
+            " resourceType 为 %s、id 为 %s 的资源"
+            % (
+                quoted,
+                json.dumps(resource_type, ensure_ascii=False),
+                json.dumps(resource_id, ensure_ascii=False),
+            )
+        )
+    if count > 1:
+        raise FhirValidationError(
+            "相对引用 %s 目标不唯一：Bundle.entry.resource 中存在 %d 个"
+            " resourceType 为 %s、id 为 %s 的资源"
+            % (
+                quoted,
+                count,
+                json.dumps(resource_type, ensure_ascii=False),
+                json.dumps(resource_id, ensure_ascii=False),
+            )
+        )
+
+
+def _walk_references(node, contained_ids, bundle_index):
+    """递归遍历资源 JSON，校验所有键名为 reference 的字段。"""
+    if isinstance(node, dict):
+        for key, child in node.items():
+            if key == "reference":
+                # reference 为叶子值：非法形式直接拒绝，不再下钻。
+                _check_reference_value(child, contained_ids, bundle_index)
+            else:
+                _walk_references(child, contained_ids, bundle_index)
+    elif isinstance(node, list):
+        for child in node:
+            _walk_references(child, contained_ids, bundle_index)
+
+
+def check_resource_references(resource):
+    """单资源引用校验：#id 查本资源 contained，相对引用视为外部、仅校验格式。"""
+    _walk_references(resource, _contained_ids(resource), None)
+
+
+def check_bundle_references(bundle):
+    """非执行 Bundle 引用校验：相对引用必须在 entry.resource 中唯一命中。
+
+    遍历整个 Bundle JSON；每个 entry.resource 是独立顶层资源，其 #id 只在
+    自身 contained 中解析；entry 其余字段与 Bundle 顶层字段使用 Bundle 自身
+    的 contained 作用域（标准 FHIR 中通常不存在）。
+    """
+    bundle_index = {}
+    entries = bundle.get("entry")
+    entry_list = entries if isinstance(entries, list) else []
+    for entry in entry_list:
+        if isinstance(entry, dict) and isinstance(entry.get("resource"), dict):
+            resource = entry["resource"]
+            resource_type = resource.get("resourceType")
+            resource_id = resource.get("id")
+            if _is_nonempty_str(resource_type) and _is_nonempty_str(resource_id):
+                key = (resource_type, resource_id)
+                bundle_index[key] = bundle_index.get(key, 0) + 1
+
+    bundle_contained = _contained_ids(bundle)
+    for key, child in bundle.items():
+        if key == "entry":
+            if not isinstance(child, list):
+                # 形态错误已由 validate_bundle 拒绝，此处无需继续。
+                continue
+            for entry in child:
+                if not isinstance(entry, dict):
+                    continue
+                for entry_key, entry_value in entry.items():
+                    if entry_key == "resource":
+                        if isinstance(entry_value, dict):
+                            _walk_references(
+                                entry_value,
+                                _contained_ids(entry_value),
+                                bundle_index,
+                            )
+                    else:
+                        _walk_references(entry_value, bundle_contained, bundle_index)
+        else:
+            _walk_references(child, bundle_contained, bundle_index)
 
 
 def validate_audit_context(audit_context):
@@ -611,6 +757,7 @@ def parse_args(argv):
     audit_path = None
     chained = False
     verify = False
+    check_references = False
     i = 0
     while i < len(argv):
         arg = argv[i]
@@ -630,6 +777,9 @@ def parse_args(argv):
         elif arg == "--audit-chain":
             chained = True
             i += 1
+        elif arg == "--check-references":
+            check_references = True
+            i += 1
         elif arg == "--verify-audit":
             verify = True
             i += 1
@@ -638,10 +788,10 @@ def parse_args(argv):
 
     if audit_path is None:
         raise AuditWriteError("缺少必需参数 --audit-file")
-    return audit_path, chained, verify
+    return audit_path, chained, verify, check_references
 
 
-def process(raw_text, audit_path, chained=False):
+def process(raw_text, audit_path, chained=False, check_references=False):
     try:
         request = json.loads(raw_text)
     except (json.JSONDecodeError, ValueError) as exc:
@@ -669,8 +819,14 @@ def process(raw_text, audit_path, chained=False):
     if is_bundle:
         # 顺序：Bundle 自身 → 各 entry.resource（均在 term_maps 校验之前）。
         validate_bundle(resource)
+        if check_references:
+            # 非 transaction/batch Bundle：引用校验同样位于 term_maps 之前，
+            # 失败时为 FhirValidationError，不写审计。
+            check_bundle_references(resource)
     else:
         validate_resource(resource)
+        if check_references:
+            check_resource_references(resource)
     index = build_term_index(term_maps)
     mappings = (
         apply_bundle_mappings(resource, index)
@@ -705,7 +861,7 @@ def process(raw_text, audit_path, chained=False):
 
 def main(argv):
     try:
-        audit_path, chained, verify = parse_args(argv)
+        audit_path, chained, verify, check_references = parse_args(argv)
     except GatewayError as exc:
         _emit_error(exc)
         return 2
@@ -728,7 +884,7 @@ def main(argv):
         return 2
 
     try:
-        output = process(raw_text, audit_path, chained)
+        output = process(raw_text, audit_path, chained, check_references)
     except GatewayError as exc:
         _emit_error(exc)
         return 2

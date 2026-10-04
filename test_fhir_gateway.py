@@ -27,10 +27,15 @@ def run(payload, audit_file=None, args=None, raw=None):
 
 
 CHAIN_ARGS = ["--audit-chain"]
+CHECK_ARGS = ["--check-references"]
 
 
 def run_chain(payload, audit_file, raw=None):
     return run(payload, audit_file, args=CHAIN_ARGS, raw=raw)
+
+
+def run_check(payload, audit_file, raw=None):
+    return run(payload, audit_file, args=CHECK_ARGS, raw=raw)
 
 
 def run_verify(audit_file, stdin=subprocess.DEVNULL):
@@ -1287,6 +1292,443 @@ class VerifyAuditTests(unittest.TestCase):
             self._seed_chain(audit_file, [{"audit_id": "a1"}])
             # 即使标准输入喂入数据，校验模式也忽略它。
             result = run_verify(audit_file, stdin=subprocess.PIPE)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout)["line_count"], 1)
+
+
+class ReferenceCheckTests(unittest.TestCase):
+    def assert_ref_error(self, proc, audit_file, value=None):
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        self.assertEqual(proc.stdout, "")
+        self.assertFalse(os.path.exists(audit_file))
+        err = json.loads(proc.stderr)
+        self.assertEqual(err["error"]["type"], "FhirValidationError")
+        self.assertTrue(err["error"]["message"])
+        # stderr 恰好一行 JSON；message 含引用值或其形态描述。
+        self.assertEqual(proc.stderr.count("\n"), 1)
+        if value is not None:
+            self.assertIn(value, err["error"]["message"])
+        return err["error"]["message"]
+
+    def _patient(self, reference=None, **extra):
+        resource = {"resourceType": "Patient", "id": "pat-1"}
+        if reference is not None:
+            resource["managingOrganization"] = {"reference": reference}
+        resource.update(extra)
+        return resource
+
+    def _observation(self, reference=None, oid="obs-1"):
+        resource = {
+            "resourceType": "Observation",
+            "id": oid,
+            "status": "final",
+            "code": {"coding": [{"system": "http://loinc.org", "code": "8867-4"}]},
+        }
+        if reference is not None:
+            resource["subject"] = {"reference": reference}
+        return resource
+
+    # ---- 单资源 ----------------------------------------------------------
+
+    def test_single_contained_fragment_hit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            resource = self._patient(
+                reference="#rp-1",
+                contained=[{"resourceType": "RelatedPerson", "id": "rp-1"}],
+            )
+            proc = run_check(base_request(resource=resource, term_maps=[]), audit_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            out = json.loads(proc.stdout)
+            self.assertEqual(
+                list(out.keys()),
+                ["status", "resource_type", "resource", "mappings", "audit"],
+            )
+            self.assertEqual(out["resource"], resource)
+            self.assertEqual(out["mappings"], [])
+            self.assertEqual(
+                set(out["audit"]),
+                {"request_id", "actor", "recorded_at", "decision", "audit_id"},
+            )
+            with open(audit_file, encoding="utf-8") as fh:
+                raw = fh.read()
+            self.assertNotIn("#rp-1", raw)
+
+    def test_single_contained_fragment_miss(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            resource = self._patient(
+                reference="#ghost",
+                contained=[{"resourceType": "RelatedPerson", "id": "rp-1"}],
+            )
+            proc = run_check(base_request(resource=resource, term_maps=[]), audit_file)
+            self.assert_ref_error(proc, audit_file, "#ghost")
+
+    def test_fragment_cannot_hit_top_level_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            # #pat-1 只能命中同资源 contained，不能命中资源自身的顶层 id。
+            resource = self._patient(reference="#pat-1")
+            proc = run_check(base_request(resource=resource, term_maps=[]), audit_file)
+            self.assert_ref_error(proc, audit_file, "#pat-1")
+
+    def test_single_relative_reference_is_external_format_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            resource = self._patient(reference="Organization/org-1")
+            proc = run_check(base_request(resource=resource, term_maps=[]), audit_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_single_absolute_urls_are_external(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            for url in (
+                "http://example.com/fhir/Patient/p1",
+                "https://example.com/fhir/Patient/p1",
+                "http://x",
+            ):
+                resource = self._patient(reference=url)
+                proc = run_check(
+                    base_request(resource=resource, term_maps=[]), audit_file
+                )
+                self.assertEqual(proc.returncode, 0, (url, proc.stderr))
+
+    def test_reference_without_key_accepted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            resource = self._patient()
+            resource["managingOrganization"] = {"display": "某机构"}
+            proc = run_check(base_request(resource=resource, term_maps=[]), audit_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_nested_reference_is_traversed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            resource = {
+                "resourceType": "Patient",
+                "id": "pat-1",
+                "contact": [
+                    {
+                        "name": {"text": "x"},
+                        "extension": [
+                            {"url": "e", "valueReference": {"reference": "Patient/x"}}
+                        ],
+                    }
+                ],
+            }
+            # 单资源：相对引用仅校验格式，"Patient/x" 合法。
+            proc = run_check(base_request(resource=resource, term_maps=[]), audit_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            with open(audit_file, encoding="utf-8") as fh:
+                lines_before = fh.read()
+            self.assertEqual(lines_before.count("\n"), 1)
+
+            resource["contact"][0]["extension"][0]["valueReference"]["reference"] = 123
+            proc = run_check(base_request(resource=resource, term_maps=[]), audit_file)
+            self.assertEqual(proc.returncode, 2)
+            self.assertEqual(proc.stdout, "")
+            # 失败不追加审计行。
+            with open(audit_file, encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), lines_before)
+
+    def test_bad_reference_forms_rejected(self):
+        cases = [
+            ("Patient", "Patient"),
+            ("Patient/", None),
+            ("/pat-1", None),
+            ("Patient/p1/extra", None),
+            ("#", "#"),
+            ("urn:uuid:abc", "urn:uuid:abc"),
+            ("Patient p1", None),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            for value, fragment in cases:
+                resource = self._patient(reference=value)
+                proc = run_check(
+                    base_request(resource=resource, term_maps=[]), audit_file
+                )
+                message = self.assert_ref_error(
+                    proc, audit_file, fragment if fragment is not None else value
+                )
+                # 每条失败都有唯一原因，且不写审计。
+                self.assertTrue(message)
+
+    def test_non_string_reference_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            for bad in (123, 1.5, True, None, ["Patient/p1"], {"reference": "x"}):
+                resource = self._patient()
+                resource["managingOrganization"] = {"reference": bad}
+                proc = run_check(
+                    base_request(resource=resource, term_maps=[]), audit_file
+                )
+                self.assert_ref_error(proc, audit_file)
+
+    def test_empty_string_reference_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            resource = self._patient(reference="")
+            proc = run_check(base_request(resource=resource, term_maps=[]), audit_file)
+            self.assert_ref_error(proc, audit_file, '""')
+
+    def test_without_flag_references_not_checked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            # 无 --check-references：悬空片段、非法形式、非字符串全部放行。
+            for bad in ("#ghost", "not-a-ref", 123, ""):
+                resource = self._patient()
+                resource["managingOrganization"] = {"reference": bad}
+                proc = run(base_request(resource=resource, term_maps=[]), audit_file)
+                self.assertEqual(proc.returncode, 0, (bad, proc.stderr))
+
+    # ---- 非执行 Bundle ----------------------------------------------------
+
+    def _ref_bundle(self, ref, btype="collection"):
+        return bundle_request(
+            [
+                patient_entry("pat-1"),
+                {
+                    "resource": {
+                        "resourceType": "Observation",
+                        "id": "obs-1",
+                        "status": "final",
+                        "code": {
+                            "coding": [{"system": "http://loinc.org", "code": "8867-4"}]
+                        },
+                        "subject": {"reference": ref},
+                    }
+                },
+            ],
+            bundle_type=btype,
+        )
+
+    def test_bundle_cross_entry_hit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            proc = run_check(self._ref_bundle("Patient/pat-1"), audit_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            out = json.loads(proc.stdout)
+            self.assertEqual(out["resource_type"], "Bundle")
+            self.assertEqual(
+                list(out.keys()),
+                ["status", "resource_type", "resource", "mappings", "audit"],
+            )
+            with open(audit_file, encoding="utf-8") as fh:
+                self.assertEqual(len(fh.readlines()), 1)
+
+    def test_bundle_cross_entry_miss(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            proc = run_check(self._ref_bundle("Patient/ghost"), audit_file)
+            self.assert_ref_error(proc, audit_file, "Patient/ghost")
+
+    def test_bundle_duplicate_target_is_ambiguous(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            req = self._ref_bundle("Patient/pat-1")
+            req["resource"]["entry"].append(patient_entry("pat-1"))
+            proc = run_check(req, audit_file)
+            message = self.assert_ref_error(proc, audit_file, "Patient/pat-1")
+            self.assertIn("不唯一", message)
+
+    def test_bundle_type_and_id_must_both_match(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            # 存在 Patient/pat-1 与 Observation/obs-1，Observation/pat-1 不命中。
+            proc = run_check(self._ref_bundle("Observation/pat-1"), audit_file)
+            self.assert_ref_error(proc, audit_file, "Observation/pat-1")
+
+    def test_bundle_fragment_scoped_to_entry_resource(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            # 其他 entry 的 Patient/pat-1 不能作为 #pat-1 命中。
+            proc = run_check(self._ref_bundle("#pat-1"), audit_file)
+            self.assert_ref_error(proc, audit_file, "#pat-1")
+
+            # 同 entry.resource.contained 内命中即可。
+            req = self._ref_bundle("#inline")
+            req["resource"]["entry"][1]["resource"]["contained"] = [
+                {"resourceType": "Patient", "id": "inline"}
+            ]
+            proc = run_check(req, audit_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_bundle_absolute_url_is_external(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            proc = run_check(
+                self._ref_bundle("https://example.com/fhir/Patient/x"), audit_file
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_bundle_malformed_reference_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            for ref in ("Patient", "Patient/", "#", "urn:uuid:1", 7):
+                proc = run_check(self._ref_bundle(ref), audit_file)
+                self.assert_ref_error(proc, audit_file)
+
+    def test_bundle_level_reference_checked_against_index(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            req = bundle_request([patient_entry("pat-1")])
+            req["resource"]["link"] = [
+                {"extension": [{"valueReference": {"reference": "Patient/zzz"}}]}
+            ]
+            proc = run_check(req, audit_file)
+            self.assert_ref_error(proc, audit_file, "Patient/zzz")
+
+    def test_bundle_non_executable_types_all_checked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            for btype in (
+                "document",
+                "message",
+                "transaction-response",
+                "batch-response",
+                "history",
+                "searchset",
+                "collection",
+            ):
+                req = self._ref_bundle("Patient/ghost", btype=btype)
+                proc = run_check(req, audit_file)
+                self.assertEqual(proc.returncode, 2, (btype, proc.stderr))
+                err = json.loads(proc.stderr)
+                self.assertEqual(err["error"]["type"], "FhirValidationError")
+
+    # ---- transaction/batch 完全旁路 --------------------------------------
+
+    def test_executable_bundles_skip_reference_checks(self):
+        for btype in ("transaction", "batch"):
+            with tempfile.TemporaryDirectory() as tmp:
+                audit_file = os.path.join(tmp, "audit-%s.jsonl" % btype)
+                entries = [
+                    tx_entry(
+                        {
+                            "resourceType": "Observation",
+                            "id": "obs-1",
+                            "status": "final",
+                            "code": {
+                                "coding": [
+                                    {"system": "http://loinc.org", "code": "8867-4"}
+                                ]
+                            },
+                            "subject": {"reference": "Patient/ghost"},
+                        }
+                    )
+                ]
+                proc = run_check(executable_request(entries, btype), audit_file)
+                self.assertEqual(proc.returncode, 0, (btype, proc.stderr))
+                out = json.loads(proc.stdout)
+                self.assertEqual(out["status"], 200)
+                self.assertEqual(out["resource"]["entry"][0]["status"], 200)
+                # 审计照常写入。
+                self.assertTrue(os.path.exists(audit_file))
+
+    def test_executable_bundle_failure_semantics_unchanged_with_flag(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            entries = [
+                tx_entry(patient_resource("pat-1")),
+                tx_entry(patient_resource("pat-2"), method="DELETE"),
+            ]
+            # transaction：全有或全无；batch：逐项独立。
+            proc = run_check(executable_request(entries, "transaction"), audit_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(json.loads(proc.stdout)["status"], 400)
+            proc = run_check(executable_request(entries, "batch"), audit_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(json.loads(proc.stdout)["status"], 200)
+
+    # ---- 优先级与组合 ----------------------------------------------------
+
+    def test_input_error_precedes_reference_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            req = base_request(resource=self._patient("#ghost"), term_maps=[])
+            req["audit_context"] = {"request_id": "", "actor": "a", "recorded_at": "t"}
+            proc = run_check(req, audit_file)
+            self.assertEqual(proc.returncode, 2)
+            self.assertEqual(
+                json.loads(proc.stderr)["error"]["type"], "InputError"
+            )
+            self.assertFalse(os.path.exists(audit_file))
+
+    def test_resource_validation_precedes_reference_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            # Observation.status 非法 + 悬空引用：先报资源校验错误。
+            resource = self._observation("Patient/ghost")
+            resource["status"] = "draft"
+            proc = run_check(
+                base_request(resource=resource, term_maps=[]), audit_file
+            )
+            self.assertEqual(proc.returncode, 2)
+            err = json.loads(proc.stderr)
+            self.assertEqual(err["error"]["type"], "FhirValidationError")
+            self.assertIn("status", err["error"]["message"])
+            self.assertFalse(os.path.exists(audit_file))
+
+    def test_reference_error_precedes_term_mapping_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            req = base_request(resource=self._patient("#ghost"))
+            req["term_maps"] = [
+                {"system": "", "code": "c", "target_system": "ts", "target_code": "tc"}
+            ]
+            proc = run_check(req, audit_file)
+            self.assertEqual(proc.returncode, 2)
+            self.assertEqual(
+                json.loads(proc.stderr)["error"]["type"], "FhirValidationError"
+            )
+            self.assertFalse(os.path.exists(audit_file))
+
+            # 不带选项时同一请求落到术语映射错误。
+            proc = run(req, audit_file)
+            self.assertEqual(proc.returncode, 2)
+            self.assertEqual(
+                json.loads(proc.stderr)["error"]["type"], "TermMappingError"
+            )
+
+    def test_check_references_with_audit_chain(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            resource = self._patient(
+                reference="#rp-1",
+                contained=[{"resourceType": "RelatedPerson", "id": "rp-1"}],
+            )
+            req = base_request(resource=resource, term_maps=[])
+            proc = run(req, audit_file, args=["--check-references", "--audit-chain"])
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            out = json.loads(proc.stdout)
+            self.assertRegex(out["audit"]["audit_digest"], r"^[0-9a-f]{64}$")
+            # 字段不新增（仅链式模式既有的 audit_digest），引用值不入审计。
+            with open(audit_file, encoding="utf-8") as fh:
+                raw = fh.read()
+            self.assertNotIn("#rp-1", raw)
+            self.assertEqual(
+                run_verify(audit_file).returncode, 0
+            )
+
+    def test_check_references_does_not_affect_verify_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            proc = run_chain(base_request(), audit_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    GATEWAY,
+                    "--check-references",
+                    "--verify-audit",
+                    "--audit-file",
+                    audit_file,
+                ],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+            )
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(json.loads(result.stdout)["line_count"], 1)
 

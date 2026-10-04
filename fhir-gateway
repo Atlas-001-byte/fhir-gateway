@@ -5,6 +5,7 @@
     fhir-gateway --audit-file PATH < request.json
     fhir-gateway --audit-chain --audit-file PATH < request.json
     fhir-gateway --check-references --audit-file PATH < request.json
+    fhir-gateway --audit-errors --audit-file PATH < request.json
     fhir-gateway --verify-audit --audit-file PATH
 
 仅使用 Python 标准库，从零实现，不依赖任何外部 FHIR/术语库。
@@ -19,6 +20,10 @@ stdout 与落盘一致；--verify-audit 仅校验链式文件，不读取标准�
 --check-references 开启本地引用完整性校验（#id 查同资源 contained，非执行
 Bundle 的 ResourceType/id 必须在 entry.resource 中唯一命中；单资源相对引用
 与 http(s):// 完整 URL 视为外部引用，仅校验形式）；不开启时行为完全不变。
+--audit-errors 开启拒绝审计：请求处理失败（非 AuditWriteError）时先向
+--audit-file 追加一条 decision=rejected 的审计记录（仅含 request_id、actor、
+recorded_at、decision、audit_id、error_type、phase、status；audit_context
+三值任一缺失则三项为 null），再按原样输出错误；不开启时行为完全不变。
 """
 
 import hashlib
@@ -94,6 +99,66 @@ class AuditVerificationError(GatewayError):
 
 def _is_nonempty_str(value):
     return isinstance(value, str) and value != ""
+
+
+# 拒绝记录的 phase 按异常类型归类：请求结构类 → request，资源/引用类 →
+# validation，term_maps 字段或同源冲突类 → mapping。
+REJECTION_PHASES = (
+    (InputError, "request"),
+    (FhirValidationError, "validation"),
+    (TermMappingError, "mapping"),
+)
+
+
+def _rejection_phase(exc):
+    for error_cls, phase in REJECTION_PHASES:
+        if isinstance(exc, error_cls):
+            return phase
+    return None
+
+
+def build_rejection_record(raw_text, exc):
+    """为请求处理失败构造 decision=rejected 的审计记录。
+
+    仅保留 audit_context 三值（任一缺失/为空则三项均为 null），不写入
+    resource、term_maps、引用、message 或请求正文。
+    """
+    request_id = None
+    actor = None
+    recorded_at = None
+    try:
+        request = json.loads(raw_text)
+    except (json.JSONDecodeError, ValueError):
+        request = None
+    if isinstance(request, dict):
+        audit_context = request.get("audit_context")
+        if isinstance(audit_context, dict):
+            values = [
+                audit_context.get(field)
+                for field in ("request_id", "actor", "recorded_at")
+            ]
+            if all(_is_nonempty_str(value) for value in values):
+                request_id, actor, recorded_at = values
+
+    return {
+        "request_id": request_id,
+        "actor": actor,
+        "recorded_at": recorded_at,
+        "decision": "rejected",
+        "audit_id": uuid.uuid4().hex,
+        "error_type": type(exc).__name__,
+        "phase": _rejection_phase(exc),
+        "status": 400,
+    }
+
+
+def append_rejection_record(audit_path, chained, raw_text, exc):
+    """追加拒绝审计记录；链式模式沿用规范 JSON 与 SHA-256 链。"""
+    record = build_rejection_record(raw_text, exc)
+    if chained:
+        append_chained_audit_line(audit_path, record)
+    else:
+        append_audit_line(audit_path, record)
 
 
 def _find_codings(node, out):
@@ -758,6 +823,7 @@ def parse_args(argv):
     chained = False
     verify = False
     check_references = False
+    audit_errors = False
     i = 0
     while i < len(argv):
         arg = argv[i]
@@ -780,6 +846,9 @@ def parse_args(argv):
         elif arg == "--check-references":
             check_references = True
             i += 1
+        elif arg == "--audit-errors":
+            audit_errors = True
+            i += 1
         elif arg == "--verify-audit":
             verify = True
             i += 1
@@ -788,7 +857,10 @@ def parse_args(argv):
 
     if audit_path is None:
         raise AuditWriteError("缺少必需参数 --audit-file")
-    return audit_path, chained, verify, check_references
+    if verify and audit_errors:
+        # 校验模式只读、不追加，与拒绝审计互斥。
+        raise InputError("--verify-audit 不能与 --audit-errors 同用")
+    return audit_path, chained, verify, check_references, audit_errors
 
 
 def process(raw_text, audit_path, chained=False, check_references=False):
@@ -861,7 +933,9 @@ def process(raw_text, audit_path, chained=False, check_references=False):
 
 def main(argv):
     try:
-        audit_path, chained, verify, check_references = parse_args(argv)
+        audit_path, chained, verify, check_references, audit_errors = parse_args(
+            argv
+        )
     except GatewayError as exc:
         _emit_error(exc)
         return 2
@@ -886,6 +960,15 @@ def main(argv):
     try:
         output = process(raw_text, audit_path, chained, check_references)
     except GatewayError as exc:
+        if audit_errors and _rejection_phase(exc) is not None:
+            # 拒绝审计：先追加 rejected 记录，再按原样输出错误。
+            # 记录本身写不进去（链不合法、不可写、追加不完整）时统一
+            # AuditWriteError，原文件不变且不再重试记录。
+            try:
+                append_rejection_record(audit_path, chained, raw_text, exc)
+            except AuditWriteError as write_exc:
+                _emit_error(write_exc)
+                return 2
         _emit_error(exc)
         return 2
 

@@ -1733,5 +1733,283 @@ class ReferenceCheckTests(unittest.TestCase):
             self.assertEqual(json.loads(result.stdout)["line_count"], 1)
 
 
+AUDIT_ERRORS_ARGS = ["--audit-errors"]
+
+
+def run_audit_errors(payload, audit_file, args=None, raw=None):
+    return run(payload, audit_file, args=AUDIT_ERRORS_ARGS + (args or []), raw=raw)
+
+
+def read_audit_lines(audit_file):
+    with open(audit_file, encoding="utf-8") as fh:
+        return [json.loads(line) for line in fh.read().splitlines()]
+
+
+class AuditErrorsTests(unittest.TestCase):
+    REJECTION_FIELDS = {
+        "request_id",
+        "actor",
+        "recorded_at",
+        "decision",
+        "audit_id",
+        "error_type",
+        "phase",
+        "status",
+    }
+
+    def assert_rejection(self, record, error_type, phase, context=None):
+        self.assertEqual(set(record), self.REJECTION_FIELDS)
+        self.assertEqual(record["decision"], "rejected")
+        self.assertEqual(record["status"], 400)
+        self.assertEqual(record["error_type"], error_type)
+        self.assertEqual(record["phase"], phase)
+        self.assertTrue(record["audit_id"])
+        if context is None:
+            self.assertIsNone(record["request_id"])
+            self.assertIsNone(record["actor"])
+            self.assertIsNone(record["recorded_at"])
+        else:
+            self.assertEqual(record["request_id"], context["request_id"])
+            self.assertEqual(record["actor"], context["actor"])
+            self.assertEqual(record["recorded_at"], context["recorded_at"])
+
+    def test_invalid_json_rejection_with_null_context(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            proc = run_audit_errors(None, audit_file, raw="not json")
+            self.assertEqual(proc.returncode, 2)
+            self.assertEqual(proc.stdout, "")
+            err = json.loads(proc.stderr)["error"]
+            self.assertEqual(err["type"], "InputError")
+            (record,) = read_audit_lines(audit_file)
+            self.assert_rejection(record, "InputError", "request")
+
+    def test_request_structure_failure_keeps_valid_context(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            req = base_request()
+            del req["resource"]
+            proc = run_audit_errors(req, audit_file)
+            self.assertEqual(proc.returncode, 2)
+            self.assertEqual(proc.stdout, "")
+            (record,) = read_audit_lines(audit_file)
+            self.assert_rejection(
+                record, "InputError", "request", context=req["audit_context"]
+            )
+
+    def test_audit_context_failure_nulls_trio(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            req = base_request(
+                audit_context={"request_id": "r", "actor": "", "recorded_at": "t"}
+            )
+            proc = run_audit_errors(req, audit_file)
+            self.assertEqual(proc.returncode, 2)
+            (record,) = read_audit_lines(audit_file)
+            self.assert_rejection(record, "InputError", "request")
+
+    def test_validation_failure_phase(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            req = base_request(
+                resource={"resourceType": "Observation", "id": "o1", "status": "bogus"}
+            )
+            proc = run_audit_errors(req, audit_file)
+            self.assertEqual(proc.returncode, 2)
+            self.assertEqual(proc.stdout, "")
+            err = json.loads(proc.stderr)["error"]
+            self.assertEqual(err["type"], "FhirValidationError")
+            (record,) = read_audit_lines(audit_file)
+            self.assert_rejection(
+                record, "FhirValidationError", "validation",
+                context=req["audit_context"],
+            )
+
+    def test_reference_failure_is_validation_phase(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            resource = {
+                "resourceType": "Observation",
+                "id": "o1",
+                "status": "final",
+                "code": {"coding": [{"system": "s", "code": "c"}]},
+                "subject": {"reference": "#missing"},
+            }
+            req = base_request(resource=resource, term_maps=[])
+            proc = run_audit_errors(req, audit_file, args=["--check-references"])
+            self.assertEqual(proc.returncode, 2)
+            (record,) = read_audit_lines(audit_file)
+            self.assert_rejection(
+                record, "FhirValidationError", "validation",
+                context=req["audit_context"],
+            )
+
+    def test_mapping_failures_phase(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            bad_item = base_request(term_maps=[{"system": "s"}])
+            proc = run_audit_errors(bad_item, audit_file)
+            self.assertEqual(proc.returncode, 2)
+            conflict = base_request(
+                term_maps=[
+                    {"system": "s", "code": "c",
+                     "target_system": "t", "target_code": "1"},
+                    {"system": "s", "code": "c",
+                     "target_system": "t", "target_code": "2"},
+                ]
+            )
+            proc = run_audit_errors(conflict, audit_file)
+            self.assertEqual(proc.returncode, 2)
+            records = read_audit_lines(audit_file)
+            self.assertEqual(len(records), 2)
+            for record in records:
+                self.assert_rejection(
+                    record, "TermMappingError", "mapping",
+                    context=conflict["audit_context"],
+                )
+            self.assertNotEqual(records[0]["audit_id"], records[1]["audit_id"])
+
+    def test_rejection_record_privacy_boundary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            req = base_request(
+                resource={"resourceType": "Patient", "name": "secret-patient"}
+            )
+            proc = run_audit_errors(req, audit_file)
+            self.assertEqual(proc.returncode, 2)
+            with open(audit_file, encoding="utf-8") as fh:
+                raw = fh.read()
+            # 不写入 resource、term_maps、引用、message 或正文内容。
+            self.assertNotIn("secret-patient", raw)
+            self.assertNotIn("resource", raw)
+            self.assertNotIn("term_maps", raw)
+            self.assertNotIn("message", raw)
+            self.assertNotIn("resource.id", raw)
+
+    def test_flag_off_failure_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            proc = run(base_request(resource={"resourceType": "Patient"}), audit_file)
+            self.assertEqual(proc.returncode, 2)
+            self.assertFalse(os.path.exists(audit_file))
+
+    def test_success_path_unchanged_with_flag(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            proc = run_audit_errors(base_request(), audit_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            out = json.loads(proc.stdout)
+            self.assertEqual(out["status"], "accepted")
+            (record,) = read_audit_lines(audit_file)
+            self.assertEqual(record["decision"], "accepted")
+            self.assertNotIn("error_type", record)
+            self.assertNotIn("phase", record)
+
+    def test_transaction_entry_failure_adds_no_rejection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            req = base_request(
+                resource={
+                    "resourceType": "Bundle",
+                    "id": "b1",
+                    "type": "transaction",
+                    "entry": [
+                        {
+                            "request": {"method": "DELETE", "url": "Patient/p1"},
+                            "resource": {"resourceType": "Patient", "id": "p1"},
+                        }
+                    ],
+                },
+                term_maps=[],
+            )
+            proc = run_audit_errors(req, audit_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            out = json.loads(proc.stdout)
+            self.assertEqual(out["status"], 400)
+            (record,) = read_audit_lines(audit_file)
+            self.assertEqual(record["decision"], "accepted")
+            self.assertEqual(record["entry_failed"], 1)
+
+    def test_chained_rejection_verifies(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            ok = run_audit_errors(base_request(), audit_file, args=["--audit-chain"])
+            self.assertEqual(ok.returncode, 0, ok.stderr)
+            bad = run_audit_errors(
+                base_request(resource={"resourceType": "Patient"}),
+                audit_file,
+                args=["--audit-chain"],
+            )
+            self.assertEqual(bad.returncode, 2)
+            lines = read_audit_lines(audit_file)
+            self.assertEqual(len(lines), 2)
+            rejection = lines[1]
+            self.assertEqual(rejection["decision"], "rejected")
+            body = {k: v for k, v in rejection.items() if k != "audit_digest"}
+            self.assertEqual(
+                rejection["audit_digest"],
+                chain_digest(lines[0]["audit_digest"], body),
+            )
+            proc = run_verify(audit_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(json.loads(proc.stdout)["line_count"], 2)
+
+    def test_broken_chain_rejection_is_write_error_file_untouched(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            write_lines(audit_file, ['{"plain": true}'])
+            proc = run_audit_errors(
+                base_request(resource={"resourceType": "Patient"}),
+                audit_file,
+                args=["--audit-chain"],
+            )
+            self.assertEqual(proc.returncode, 2)
+            self.assertEqual(proc.stdout, "")
+            err = json.loads(proc.stderr)["error"]
+            self.assertEqual(err["type"], "AuditWriteError")
+            with open(audit_file, encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), '{"plain": true}\n')
+
+    def test_unwritable_audit_target_is_write_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "missing-dir", "audit.jsonl")
+            proc = run_audit_errors(
+                base_request(resource={"resourceType": "Patient"}), audit_file
+            )
+            self.assertEqual(proc.returncode, 2)
+            self.assertEqual(proc.stdout, "")
+            err = json.loads(proc.stderr)["error"]
+            self.assertEqual(err["type"], "AuditWriteError")
+            self.assertFalse(os.path.exists(audit_file))
+
+    def test_verify_audit_with_flag_is_input_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    GATEWAY,
+                    "--verify-audit",
+                    "--audit-errors",
+                    "--audit-file",
+                    audit_file,
+                ],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(result.stdout, "")
+            err = json.loads(result.stderr)["error"]
+            self.assertEqual(err["type"], "InputError")
+            self.assertFalse(os.path.exists(audit_file))
+
+    def test_missing_audit_file_arg_still_write_error(self):
+        proc = run(base_request(), args=AUDIT_ERRORS_ARGS)
+        self.assertEqual(proc.returncode, 2)
+        err = json.loads(proc.stderr)["error"]
+        self.assertEqual(err["type"], "AuditWriteError")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

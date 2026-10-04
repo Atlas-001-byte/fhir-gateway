@@ -1140,6 +1140,226 @@ class AuditChainWriteTests(unittest.TestCase):
             self.assertNotIn("audit_digest", lines[1])
 
 
+CHECK_ARGS = ["--check-references"]
+
+
+def run_check(payload, audit_file, raw=None):
+    return run(payload, audit_file, args=CHECK_ARGS, raw=raw)
+
+
+class ReferenceCheckTests(unittest.TestCase):
+    def assert_ref_error(self, proc, needle, audit_file):
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(proc.stdout, "")
+        self.assertEqual(proc.stderr.count("\n"), 1)
+        err = json.loads(proc.stderr)
+        self.assertEqual(err["error"]["type"], "FhirValidationError")
+        self.assertIn(needle, err["error"]["message"])
+        # 引用校验失败不写审计文件。
+        self.assertFalse(os.path.exists(audit_file))
+
+    def test_dangling_reference_accepted_without_flag(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            req = base_request()
+            req["resource"]["subject"] = {"reference": "#nope"}
+            proc = run(req, audit_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            out = json.loads(proc.stdout)
+            self.assertEqual(out["status"], "accepted")
+
+    def test_contained_reference_hit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            req = base_request()
+            req["resource"]["contained"] = [{"resourceType": "Patient", "id": "p1"}]
+            req["resource"]["subject"] = {"reference": "#p1"}
+            proc = run_check(req, audit_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            out = json.loads(proc.stdout)
+            # 成功响应字段不变，不新增字段。
+            self.assertEqual(
+                list(out.keys()),
+                ["status", "resource_type", "resource", "mappings", "audit"],
+            )
+            self.assertEqual(out["resource"], req["resource"])
+            with open(audit_file, encoding="utf-8") as fh:
+                lines = [json.loads(line) for line in fh if line.strip()]
+            self.assertEqual(len(lines), 1)
+            # 资源正文与引用值不入审计。
+            self.assertNotIn("p1", json.dumps(lines[0], ensure_ascii=False))
+
+    def test_contained_reference_missing_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            req = base_request()
+            req["resource"]["subject"] = {"reference": "#ghost"}
+            proc = run_check(req, audit_file)
+            self.assert_ref_error(proc, "#ghost", audit_file)
+            self.assertIn("缺少本地目标", json.loads(proc.stderr)["error"]["message"])
+
+    def test_relative_reference_in_single_resource_is_external(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            req = base_request()
+            # 单资源中的 ResourceType/id 仅校验格式，目标无需存在。
+            req["resource"]["subject"] = {"reference": "Patient/not-here"}
+            proc = run_check(req, audit_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_absolute_url_is_external(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            req = base_request()
+            req["resource"]["subject"] = {
+                "reference": "http://example.org/fhir/Patient/p1"
+            }
+            req["resource"]["basedOn"] = {
+                "reference": "https://example.org/fhir/ServiceRequest/s1"
+            }
+            proc = run_check(req, audit_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_non_string_and_empty_reference_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            for bad in (123, "", None, {"reference": "x"}, ["Patient/p1"]):
+                req = base_request()
+                req["resource"]["subject"] = {"reference": bad}
+                proc = run_check(req, audit_file)
+                self.assert_ref_error(proc, "非空字符串", audit_file)
+
+    def test_reference_object_without_reference_accepted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            req = base_request()
+            req["resource"]["subject"] = {"display": "仅显示，无 reference"}
+            proc = run_check(req, audit_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_unsupported_reference_form_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            for bad in ("urn:uuid:1234", "Patient", "Patient/", "a/b/c"):
+                req = base_request()
+                req["resource"]["subject"] = {"reference": bad}
+                proc = run_check(req, audit_file)
+                self.assert_ref_error(proc, bad, audit_file)
+                self.assertIn("形式不受支持", json.loads(proc.stderr)["error"]["message"])
+
+    def test_nested_reference_checked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            req = base_request()
+            req["resource"]["component"] = [
+                {"target": [{"subject": {"reference": "#deep"}}]}
+            ]
+            proc = run_check(req, audit_file)
+            self.assert_ref_error(proc, "#deep", audit_file)
+
+    def test_bundle_relative_reference_hit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            obs = observation_entry("obs-1")
+            obs["resource"]["subject"] = {"reference": "Patient/pat-1"}
+            req = bundle_request([patient_entry("pat-1"), obs])
+            proc = run_check(req, audit_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            out = json.loads(proc.stdout)
+            self.assertEqual(out["resource_type"], "Bundle")
+            self.assertEqual(out["resource"], req["resource"])
+
+    def test_bundle_relative_reference_missing_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            obs = observation_entry("obs-1")
+            obs["resource"]["subject"] = {"reference": "Patient/ghost"}
+            req = bundle_request([patient_entry("pat-1"), obs])
+            proc = run_check(req, audit_file)
+            self.assert_ref_error(proc, "Patient/ghost", audit_file)
+            self.assertIn("缺少本地目标", json.loads(proc.stderr)["error"]["message"])
+
+    def test_bundle_duplicate_target_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            obs = observation_entry("obs-1")
+            obs["resource"]["subject"] = {"reference": "Patient/pat-1"}
+            req = bundle_request(
+                [patient_entry("pat-1"), obs, patient_entry("pat-1")]
+            )
+            proc = run_check(req, audit_file)
+            self.assert_ref_error(proc, "Patient/pat-1", audit_file)
+            self.assertIn("目标不唯一", json.loads(proc.stderr)["error"]["message"])
+
+    def test_bundle_contained_scoped_per_entry_resource(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            obs = observation_entry("obs-1")
+            # #med 只在 obs-1 自己的 contained 中解析，不看其他 entry。
+            obs["resource"]["contained"] = [{"resourceType": "Patient", "id": "med"}]
+            obs["resource"]["subject"] = {"reference": "#med"}
+            req = bundle_request([patient_entry("pat-1"), obs])
+            proc = run_check(req, audit_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+            # 另一个 entry 的 contained 不算数。
+            obs2 = observation_entry("obs-2")
+            obs2["resource"]["subject"] = {"reference": "#med"}
+            req = bundle_request([patient_entry("pat-1"), obs2])
+            audit_file2 = os.path.join(tmp, "audit2.jsonl")
+            proc = run_check(req, audit_file2)
+            self.assert_ref_error(proc, "#med", audit_file2)
+
+    def test_executable_bundle_not_checked(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            res = observation_resource("obs-1")
+            res["subject"] = {"reference": "Patient/nowhere"}
+            entries = [tx_entry(res)]
+            for btype in ("transaction", "batch"):
+                proc = run_check(executable_request(entries, btype), audit_file)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                out = json.loads(proc.stdout)
+                self.assertEqual(out["status"], 200)
+                self.assertEqual(out["resource"]["entry"][0]["status"], 200)
+
+    def test_input_error_still_precedes_reference_check(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            req = base_request()
+            req["resource"]["subject"] = {"reference": "#ghost"}
+            del req["audit_context"]["actor"]
+            proc = run_check(req, audit_file)
+            self.assertEqual(proc.returncode, 2)
+            self.assertEqual(proc.stdout, "")
+            err = json.loads(proc.stderr)
+            self.assertEqual(err["error"]["type"], "InputError")
+            self.assertFalse(os.path.exists(audit_file))
+
+    def test_reference_error_precedes_term_maps(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            req = base_request()
+            req["resource"]["subject"] = {"reference": "#ghost"}
+            req["term_maps"] = [{"system": "", "code": "", "target_system": "", "target_code": ""}]
+            proc = run_check(req, audit_file)
+            self.assert_ref_error(proc, "#ghost", audit_file)
+
+    def test_check_references_with_audit_chain(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            req = base_request()
+            req["resource"]["contained"] = [{"resourceType": "Patient", "id": "p1"}]
+            req["resource"]["subject"] = {"reference": "#p1"}
+            proc = run(req, audit_file, args=CHECK_ARGS + CHAIN_ARGS)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            audit = json.loads(proc.stdout)["audit"]
+            self.assertRegex(audit["audit_digest"], r"^[0-9a-f]{64}$")
+            result = run_verify(audit_file)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout)["line_count"], 1)
+
+
 class VerifyAuditTests(unittest.TestCase):
     def assert_read_error(self, proc, expected="AuditReadError"):
         self.assertEqual(proc.returncode, 2)

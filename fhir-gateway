@@ -4,6 +4,7 @@
 用法:
     fhir-gateway --audit-file PATH < request.json
     fhir-gateway --audit-chain --audit-file PATH < request.json
+    fhir-gateway --check-references --audit-file PATH < request.json
     fhir-gateway --verify-audit --audit-file PATH
 
 仅使用 Python 标准库，从零实现，不依赖任何外部 FHIR/术语库。
@@ -15,6 +16,12 @@ type 为 transaction/batch 的 Bundle 走批量执行语义：按 entry 顺序�
 
 --audit-chain 开启后审计行增加 audit_digest（SHA-256 完整性链，可离线复核），
 stdout 与落盘一致；--verify-audit 仅校验链式文件，不读取标准输入。
+
+--check-references 开启可选的本地引用完整性校验：递归检查资源 JSON 中键名为
+reference 的字段，#id 必须命中同一顶层资源 contained 中的相同 id，非
+transaction/batch Bundle 中的 ResourceType/id 必须命中唯一 entry.resource；
+完整 URL（http://、https://）与单资源中的 ResourceType/id 视为外部引用。
+不开启时行为完全不变。
 """
 
 import hashlib
@@ -176,6 +183,121 @@ def validate_bundle(bundle):
                 raise FhirValidationError("%s 缺少 resource" % label)
             # entry 内复用同一套 Patient/Observation/Condition 校验。
             validate_resource(entry["resource"])
+
+
+# 完整 URL 前缀：外部引用，无需本地目标。
+ABSOLUTE_URL_PREFIXES = ("http://", "https://")
+
+# 相对引用 ResourceType/id 的形式：资源类型段 + 单个 id 段（FHIR id 字符集）。
+RELATIVE_REFERENCE_RE = re.compile(
+    r"^[A-Za-z][A-Za-z0-9]*/[A-Za-z0-9][A-Za-z0-9.\-]*$"
+)
+
+
+def _contained_ids(resource):
+    """顶层资源 contained 中出现的 id 集合（非对象或无 id 的项忽略）。"""
+    ids = set()
+    if isinstance(resource, dict):
+        contained = resource.get("contained")
+        if isinstance(contained, list):
+            for item in contained:
+                if isinstance(item, dict) and isinstance(item.get("id"), str):
+                    ids.add(item["id"])
+    return ids
+
+
+def _walk_reference_values(node, contained_ids, bundle_targets):
+    """递归检查 node 内所有键名为 reference 的字段（按文档顺序）。"""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == "reference":
+                _check_reference_value(value, contained_ids, bundle_targets)
+            else:
+                _walk_reference_values(value, contained_ids, bundle_targets)
+    elif isinstance(node, list):
+        for item in node:
+            _walk_reference_values(item, contained_ids, bundle_targets)
+
+
+def _check_reference_value(value, contained_ids, bundle_targets):
+    """校验单个 reference 值；bundle_targets 为 None 表示单资源。"""
+    if not _is_nonempty_str(value):
+        raise FhirValidationError(
+            "reference 必须为非空字符串: %s"
+            % json.dumps(value, ensure_ascii=False)
+        )
+    if value.startswith("#"):
+        if value[1:] not in contained_ids:
+            raise FhirValidationError(
+                '引用 "%s" 缺少本地目标: 同一顶层资源 contained 中无相同 id' % value
+            )
+        return
+    if value.startswith(ABSOLUTE_URL_PREFIXES):
+        # http(s):// 完整 URL 为外部引用。
+        return
+    if RELATIVE_REFERENCE_RE.fullmatch(value) is None:
+        raise FhirValidationError('引用 "%s" 形式不受支持' % value)
+    if bundle_targets is None:
+        # 单资源中的 ResourceType/id 为外部引用，仅校验格式，目标无需存在。
+        return
+    resource_type, target_id = value.split("/", 1)
+    count = bundle_targets.get((resource_type, target_id), 0)
+    if count == 0:
+        raise FhirValidationError(
+            '引用 "%s" 缺少本地目标: Bundle entry 中无相同 resourceType 与 id'
+            % value
+        )
+    if count > 1:
+        raise FhirValidationError(
+            '引用 "%s" 目标不唯一: Bundle entry 中存在多个相同 resourceType 与 id'
+            % value
+        )
+
+
+def check_local_references(resource):
+    """--check-references：本地引用完整性校验（单资源与非可执行 Bundle）。
+
+    #id 只解析到同一顶层资源的 contained；entry.resource 是各自独立的顶层
+    资源。Bundle 中的 ResourceType/id 必须命中唯一 entry.resource。
+    """
+    if isinstance(resource, dict) and resource.get("resourceType") == "Bundle":
+        targets = {}
+        entries = resource.get("entry")
+        if isinstance(entries, list):
+            for entry in entries:
+                if isinstance(entry, dict):
+                    entry_resource = entry.get("resource")
+                    if isinstance(entry_resource, dict):
+                        key = (
+                            entry_resource.get("resourceType"),
+                            entry_resource.get("id"),
+                        )
+                        targets[key] = targets.get(key, 0) + 1
+        bundle_contained = _contained_ids(resource)
+        # Bundle 自身（entry 之外）的引用以 Bundle 为顶层资源。
+        for key, value in resource.items():
+            if key == "entry":
+                continue
+            if key == "reference":
+                _check_reference_value(value, bundle_contained, targets)
+            else:
+                _walk_reference_values(value, bundle_contained, targets)
+        # 各 entry.resource 是独立顶层资源：#id 只看自己的 contained。
+        if isinstance(entries, list):
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                for key, value in entry.items():
+                    if key == "resource" and isinstance(value, dict):
+                        _walk_reference_values(
+                            value, _contained_ids(value), targets
+                        )
+                    elif key == "reference":
+                        _check_reference_value(value, bundle_contained, targets)
+                    elif key != "resource":
+                        _walk_reference_values(value, bundle_contained, targets)
+    else:
+        _walk_reference_values(resource, _contained_ids(resource), None)
 
 
 def validate_audit_context(audit_context):
@@ -611,6 +733,7 @@ def parse_args(argv):
     audit_path = None
     chained = False
     verify = False
+    check_references = False
     i = 0
     while i < len(argv):
         arg = argv[i]
@@ -633,15 +756,18 @@ def parse_args(argv):
         elif arg == "--verify-audit":
             verify = True
             i += 1
+        elif arg == "--check-references":
+            check_references = True
+            i += 1
         else:
             raise AuditWriteError("未知参数: %s" % arg)
 
     if audit_path is None:
         raise AuditWriteError("缺少必需参数 --audit-file")
-    return audit_path, chained, verify
+    return audit_path, chained, verify, check_references
 
 
-def process(raw_text, audit_path, chained=False):
+def process(raw_text, audit_path, chained=False, check_references=False):
     try:
         request = json.loads(raw_text)
     except (json.JSONDecodeError, ValueError) as exc:
@@ -671,6 +797,9 @@ def process(raw_text, audit_path, chained=False):
         validate_bundle(resource)
     else:
         validate_resource(resource)
+    if check_references:
+        # 本地引用完整性：仅单资源与非可执行 Bundle；transaction/batch 不检查。
+        check_local_references(resource)
     index = build_term_index(term_maps)
     mappings = (
         apply_bundle_mappings(resource, index)
@@ -705,7 +834,7 @@ def process(raw_text, audit_path, chained=False):
 
 def main(argv):
     try:
-        audit_path, chained, verify = parse_args(argv)
+        audit_path, chained, verify, check_references = parse_args(argv)
     except GatewayError as exc:
         _emit_error(exc)
         return 2
@@ -728,7 +857,7 @@ def main(argv):
         return 2
 
     try:
-        output = process(raw_text, audit_path, chained)
+        output = process(raw_text, audit_path, chained, check_references)
     except GatewayError as exc:
         _emit_error(exc)
         return 2

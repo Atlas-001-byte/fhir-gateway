@@ -16,11 +16,13 @@
 ```sh
 fhir-gateway --audit-file PATH < request.json
 fhir-gateway --audit-chain --audit-file PATH < request.json
+fhir-gateway --check-references --audit-file PATH < request.json
 fhir-gateway --verify-audit --audit-file PATH
 ```
 
 - `--audit-file PATH`（必需）：审计 JSON Lines 文件；文件不存在则创建，已存在则保留旧行并追加。
 - `--audit-chain`（可选）：为审计增加可离线复核的完整性链；不开启时行为完全不变。
+- `--check-references`（可选）：开启本地引用完整性校验；不开启时行为完全不变。
 - `--verify-audit`（可选）：只校验链式文件，不读取标准输入。
 - 请求 JSON 从标准输入读取（校验模式除外）。
 
@@ -216,6 +218,21 @@ entry 规则（按此顺序检查，命中首个问题即记录）：
 - 审计不保存资源正文、患者姓名、标识或术语映射原文，逐项只记录索引、资源类型、阶段、结果状态和问题代码。
 - 审计写入失败仍返回 `AuditWriteError` 且 stdout 为空。
 
+## 本地引用完整性校验（--check-references）
+
+开启 `--check-references` 后，在资源校验通过、`term_maps` 校验之前，递归检查资源 JSON 中所有键名为 `reference` 的字段。不开启时解析、校验、映射、输出与审计行为完全不变。
+
+- `reference` 只接受非空字符串；其他类型或空字符串拒绝。无 `reference` 字段的 Reference 对象照常接受。
+- `#id`：本地包含引用，必须命中**同一顶层资源** `contained` 中相同 `id` 的资源（Bundle 中每个 `entry.resource` 是各自独立的顶层资源）。
+- `ResourceType/id`：相对引用。
+  - 非 transaction/batch 的 Bundle 中，必须命中**唯一** `entry.resource`（`resourceType` 与 `id` 均相同）；entry 中 `resourceType` 与 `id` 相同的资源重复时，指向它的相对引用按目标不唯一拒绝。
+  - 单资源中视为外部引用，仅校验格式，目标无需存在。
+- `http://`、`https://` 开头的完整 URL 是外部引用，直接接受。
+- 其余形式（如 `urn:uuid:...`、缺少 `/` 段）按形式不受支持拒绝。
+- transaction/batch 的逐项请求、校验、映射、审计与全有或全无/逐项独立语义不变，也不检查可执行 Bundle 的跨 entry 引用。
+
+缺少本地目标、目标不唯一、`reference` 非法或形式不受支持时返回 `FhirValidationError`（message 含引用值与唯一原因）：stdout 为空、stderr 一行 JSON、退出码 `2`，且不写审计文件。`InputError`（顶层结构、`audit_context`）仍优先报告。成功响应字段不变（仍为 `resource`、`mappings`、`audit`），资源正文与引用值不入审计。
+
 ## 审计完整性链（--audit-chain）
 
 开启 `--audit-chain` 后，每次提交的审计行增加一个 `audit_digest` 字段，把历次审计串成一条可离线复核的 SHA-256 链。
@@ -285,7 +302,7 @@ python3 test_fhir_gateway.py
 
 ## 状态
 
-已实现 `fhir-gateway`：资源校验、术语映射、审计留痕端到端可用，支持单资源与 FHIR R4 Bundle；transaction/batch Bundle 支持批量执行语义（逐项校验与映射、transaction-response/batch-response、全有或全无/逐项独立、逐项审计）；`--audit-chain` 提供基于 SHA-256 的审计完整性链，`--verify-audit` 支持离线复核，含 76 个端到端测试。
+已实现 `fhir-gateway`：资源校验、术语映射、审计留痕端到端可用，支持单资源与 FHIR R4 Bundle；transaction/batch Bundle 支持批量执行语义（逐项校验与映射、transaction-response/batch-response、全有或全无/逐项独立、逐项审计）；`--audit-chain` 提供基于 SHA-256 的审计完整性链，`--verify-audit` 支持离线复核；`--check-references` 提供可选的本地引用完整性校验，含 93 个端到端测试。
 
 ## 约定
 

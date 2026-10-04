@@ -46,6 +46,18 @@ def run_verify(audit_file, stdin=subprocess.DEVNULL):
     )
 
 
+def run_find(audit_file, filters=None, args=None, stdin=subprocess.DEVNULL):
+    """只读检索模式：默认不接管道（DEVNULL），顺带验证其不读取标准输入。"""
+    cmd = [sys.executable, GATEWAY, "--audit-find", "--audit-file", audit_file]
+    if filters:
+        cmd += filters
+    if args:
+        cmd += args
+    return subprocess.run(
+        cmd, stdin=stdin, capture_output=True, text=True, timeout=30
+    )
+
+
 GENESIS_DIGEST = "0" * 64
 
 
@@ -1294,6 +1306,612 @@ class VerifyAuditTests(unittest.TestCase):
             result = run_verify(audit_file, stdin=subprocess.PIPE)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(json.loads(result.stdout)["line_count"], 1)
+
+
+class AuditFindTests(unittest.TestCase):
+    def accepted(self, audit_id, request_id="r", actor="alice",
+                 recorded_at="2026-10-01T10:00:00Z", **extra):
+        rec = {
+            "request_id": request_id,
+            "actor": actor,
+            "recorded_at": recorded_at,
+            "decision": "accepted",
+            "audit_id": audit_id,
+        }
+        rec.update(extra)
+        return rec
+
+    def rejected(self, audit_id, request_id=None, actor=None, recorded_at=None):
+        return {
+            "request_id": request_id,
+            "actor": actor,
+            "recorded_at": recorded_at,
+            "decision": "rejected",
+            "audit_id": audit_id,
+            "error_type": "InputError",
+            "phase": "request",
+            "status": 400,
+        }
+
+    def seed(self, path, records):
+        write_lines(path, [json.dumps(r, ensure_ascii=False) for r in records])
+
+    def assert_ok(self, proc, expected_ids):
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stderr, "")
+        body = json.loads(proc.stdout)
+        self.assertEqual(list(body.keys()), ["count", "records"])
+        self.assertEqual(body["count"], len(expected_ids))
+        self.assertEqual(
+            [r["audit_id"] for r in body["records"]], expected_ids
+        )
+        return body
+
+    # ---- 基本检索：空条件、行序、不去重 ------------------------------------
+
+    def test_no_filters_returns_all_valid_in_line_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            self.seed(
+                audit_file,
+                [self.accepted("a1"), self.accepted("a2"), self.accepted("a3")],
+            )
+            self.assert_ok(run_find(audit_file), ["a1", "a2", "a3"])
+
+    def test_duplicate_audit_id_not_deduped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            self.seed(audit_file, [self.accepted("dup"), self.accepted("dup")])
+            self.assert_ok(run_find(audit_file), ["dup", "dup"])
+
+    def test_empty_result_shape(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "empty.jsonl")
+            open(audit_file, "w").close()
+            proc = run_find(audit_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(
+                json.loads(proc.stdout), {"count": 0, "records": []}
+            )
+
+    def test_no_match_is_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            self.seed(audit_file, [self.accepted("a1")])
+            proc = run_find(audit_file, ["--actor", "nobody"])
+            self.assertEqual(
+                json.loads(proc.stdout), {"count": 0, "records": []}
+            )
+
+    # ---- 精确匹配 -----------------------------------------------------------
+
+    def test_filter_request_id_exact(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            self.seed(
+                audit_file,
+                [
+                    self.accepted("a1", request_id="req-1"),
+                    self.accepted("a2", request_id="req-2"),
+                    self.accepted("a3", request_id="req-1"),
+                ],
+            )
+            self.assert_ok(
+                run_find(audit_file, ["--request-id", "req-1"]), ["a1", "a3"]
+            )
+
+    def test_filter_actor_exact(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            self.seed(
+                audit_file,
+                [
+                    self.accepted("a1", actor="alice"),
+                    self.accepted("a2", actor="bob"),
+                    self.accepted("a3", actor="alice"),
+                ],
+            )
+            self.assert_ok(run_find(audit_file, ["--actor", "bob"]), ["a2"])
+
+    def test_exact_match_is_not_substring(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            self.seed(audit_file, [self.accepted("a1", actor="alice")])
+            self.assert_ok(run_find(audit_file, ["--actor", "alic"]), [])
+
+    def test_filter_decision_accepted_and_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            self.seed(
+                audit_file,
+                [
+                    self.accepted("a1"),
+                    self.rejected("r1", request_id="r", actor="alice",
+                                  recorded_at="2026-10-01T10:00:00Z"),
+                    self.accepted("a2"),
+                ],
+            )
+            self.assert_ok(
+                run_find(audit_file, ["--decision", "accepted"]),
+                ["a1", "a2"],
+            )
+            self.assert_ok(
+                run_find(audit_file, ["--decision", "rejected"]), ["r1"]
+            )
+
+    def test_conditions_combined_with_and(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            self.seed(
+                audit_file,
+                [
+                    self.accepted("a1", request_id="r1", actor="alice"),
+                    self.accepted("a2", request_id="r1", actor="bob"),
+                    self.accepted("a3", request_id="r2", actor="alice"),
+                ],
+            )
+            # request_id 与 actor 同时满足才命中。
+            self.assert_ok(
+                run_find(
+                    audit_file,
+                    ["--request-id", "r1", "--actor", "alice"],
+                ),
+                ["a1"],
+            )
+
+    # ---- 时间窗 -------------------------------------------------------------
+
+    def test_from_to_inclusive_boundaries(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            self.seed(
+                audit_file,
+                [
+                    self.accepted("lo", recorded_at="2026-10-01T09:59:59Z"),
+                    self.accepted("from", recorded_at="2026-10-01T10:00:00Z"),
+                    self.accepted("mid", recorded_at="2026-10-01T11:00:00Z"),
+                    self.accepted("to", recorded_at="2026-10-01T12:00:00Z"),
+                    self.accepted("hi", recorded_at="2026-10-01T12:00:01Z"),
+                ],
+            )
+            args = [
+                "--from", "2026-10-01T10:00:00Z",
+                "--to", "2026-10-01T12:00:00Z",
+            ]
+            self.assert_ok(run_find(audit_file, args), ["from", "mid", "to"])
+
+    def test_from_only_and_to_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            self.seed(
+                audit_file,
+                [
+                    self.accepted("a1", recorded_at="2026-10-01T08:00:00Z"),
+                    self.accepted("a2", recorded_at="2026-10-02T08:00:00Z"),
+                ],
+            )
+            self.assert_ok(
+                run_find(audit_file, ["--from", "2026-10-02T00:00:00Z"]),
+                ["a2"],
+            )
+            self.assert_ok(
+                run_find(audit_file, ["--to", "2026-10-01T23:59:59Z"]),
+                ["a1"],
+            )
+
+    def test_unparseable_recorded_at_excluded_with_date_filter_included_without(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            self.seed(
+                audit_file,
+                [
+                    self.accepted("offset", recorded_at="2026-10-01T10:00:00+08:00"),
+                    self.accepted("text", recorded_at="not-a-time"),
+                    self.accepted("good", recorded_at="2026-10-01T10:00:00Z"),
+                ],
+            )
+            # 无日期过滤：三条都命中（recorded_at 是字符串即可见）。
+            self.assert_ok(run_find(audit_file), ["offset", "text", "good"])
+            # 有日期过滤：时间不可解析的行不命中。
+            self.assert_ok(
+                run_find(audit_file, ["--from", "2026-01-01T00:00:00Z"]),
+                ["good"],
+            )
+
+    # ---- 记录形态：跳过且不计 count ----------------------------------------
+
+    def _one_skip_case(self, raw_line):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            with open(audit_file, "w", encoding="utf-8") as fh:
+                fh.write(raw_line.rstrip("\n") + "\n")
+                fh.write(
+                    json.dumps(self.accepted("keep"), ensure_ascii=False) + "\n"
+                )
+            self.assert_ok(run_find(audit_file), ["keep"])
+
+    def test_empty_audit_id_skipped(self):
+        self._one_skip_case(
+            json.dumps(
+                {"request_id": "r", "actor": "a", "recorded_at": "t",
+                 "decision": "accepted", "audit_id": ""},
+                ensure_ascii=False,
+            )
+        )
+
+    def test_missing_field_skipped(self):
+        self._one_skip_case(
+            json.dumps(
+                {"request_id": "r", "actor": "a",
+                 "decision": "accepted", "audit_id": "x"},
+                ensure_ascii=False,
+            )
+        )
+
+    def test_wrong_type_field_skipped(self):
+        self._one_skip_case(
+            json.dumps(
+                {"request_id": 1, "actor": "a", "recorded_at": "t",
+                 "decision": "accepted", "audit_id": "x"},
+                ensure_ascii=False,
+            )
+        )
+        self._one_skip_case(
+            json.dumps(
+                {"request_id": "r", "actor": "a", "recorded_at": 9,
+                 "decision": "accepted", "audit_id": "x"},
+                ensure_ascii=False,
+            )
+        )
+        self._one_skip_case(
+            json.dumps(
+                {"request_id": "r", "actor": ["a"], "recorded_at": "t",
+                 "decision": "accepted", "audit_id": "x"},
+                ensure_ascii=False,
+            )
+        )
+        self._one_skip_case(
+            json.dumps(
+                {"request_id": "r", "actor": "a", "recorded_at": "t",
+                 "decision": 400, "audit_id": "x"},
+                ensure_ascii=False,
+            )
+        )
+
+    def test_null_audit_id_and_decision_skipped(self):
+        self._one_skip_case(
+            json.dumps(
+                {"request_id": "r", "actor": "a", "recorded_at": "t",
+                 "decision": "accepted", "audit_id": None},
+                ensure_ascii=False,
+            )
+        )
+        self._one_skip_case(
+            json.dumps(
+                {"request_id": "r", "actor": "a", "recorded_at": "t",
+                 "decision": None, "audit_id": "x"},
+                ensure_ascii=False,
+            )
+        )
+
+    def test_null_context_rejected_record_is_visible(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            self.seed(audit_file, [self.rejected("r1")])
+            body = self.assert_ok(
+                run_find(audit_file, ["--decision", "rejected"]), ["r1"]
+            )
+            rec = body["records"][0]
+            self.assertIsNone(rec["request_id"])
+            self.assertIsNone(rec["actor"])
+            self.assertIsNone(rec["recorded_at"])
+
+    # ---- 输出字段：顺序与脱敏 ----------------------------------------------
+
+    def test_field_order_preserved_and_sensitive_stripped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            rec = {
+                "request_id": "req-1",
+                "actor": "alice",
+                "recorded_at": "2026-10-01T10:00:00Z",
+                "decision": "accepted",
+                "audit_id": "a1",
+                "resource": {"resourceType": "Patient", "id": "p1"},
+                "term_maps": [{"system": "s"}],
+                "message": "boom",
+                "note": "kept",
+            }
+            self.seed(audit_file, [rec])
+            body = self.assert_ok(run_find(audit_file), ["a1"])
+            out = body["records"][0]
+            self.assertEqual(
+                list(out.keys()),
+                ["request_id", "actor", "recorded_at", "decision",
+                 "audit_id", "note"],
+            )
+            self.assertNotIn("resource", out)
+            self.assertNotIn("term_maps", out)
+            self.assertNotIn("message", out)
+            self.assertEqual(out["note"], "kept")
+
+    def test_chain_line_shows_audit_digest_and_bundle_summary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            rec = self.accepted(
+                "a1",
+                audit_digest="0" * 64,
+                bundle_type="transaction",
+                entry_total=1,
+                entry_succeeded=1,
+                entry_failed=0,
+                status=200,
+                entries=[{"index": 0, "phase": "completed", "status": 200}],
+            )
+            self.seed(audit_file, [rec])
+            body = self.assert_ok(run_find(audit_file), ["a1"])
+            out = body["records"][0]
+            self.assertEqual(out["audit_digest"], "0" * 64)
+            self.assertEqual(out["bundle_type"], "transaction")
+            self.assertEqual(out["entries"][0]["index"], 0)
+            self.assertNotIn("resource", out)
+
+    # ---- AuditReadError -----------------------------------------------------
+
+    def assert_read_error(self, proc):
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(proc.stdout, "")
+        err = json.loads(proc.stderr)
+        self.assertEqual(err["error"]["type"], "AuditReadError")
+        self.assertTrue(err["error"]["message"])
+        self.assertEqual(proc.stderr.count("\n"), 1)
+
+    def test_missing_file_is_read_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assert_read_error(
+                run_find(os.path.join(tmp, "nope.jsonl"))
+            )
+
+    def test_directory_is_read_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assert_read_error(run_find(tmp))
+
+    def test_missing_parent_is_read_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assert_read_error(
+                run_find(os.path.join(tmp, "nodir", "x.jsonl"))
+            )
+
+    def test_missing_audit_file_arg_is_read_error(self):
+        cmd = [sys.executable, GATEWAY, "--audit-find"]
+        proc = subprocess.run(
+            cmd, stdin=subprocess.DEVNULL, capture_output=True,
+            text=True, timeout=30,
+        )
+        self.assert_read_error(proc)
+
+    # ---- InputError ---------------------------------------------------------
+
+    def assert_input_error(self, args):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            self.seed(audit_file, [self.accepted("a1")])
+            cmd = [sys.executable, GATEWAY, "--audit-find",
+                   "--audit-file", audit_file] + args
+            proc = subprocess.run(
+                cmd, stdin=subprocess.DEVNULL, capture_output=True,
+                text=True, timeout=30,
+            )
+            self.assertEqual(proc.returncode, 2)
+            self.assertEqual(proc.stdout, "")
+            err = json.loads(proc.stderr)
+            self.assertEqual(err["error"]["type"], "InputError")
+            self.assertTrue(err["error"]["message"])
+            self.assertEqual(proc.stderr.count("\n"), 1)
+
+    def test_bad_decision_is_input_error(self):
+        self.assert_input_error(["--decision", "maybe"])
+        self.assert_input_error(["--decision", ""])
+
+    def test_bad_timestamp_is_input_error(self):
+        self.assert_input_error(["--from", "2026-10-01"])
+        self.assert_input_error(["--to", "2026-10-01T10:00:00"])
+        self.assert_input_error(["--from", "2026-13-01T00:00:00Z"])
+
+    def test_empty_filter_value_is_input_error(self):
+        self.assert_input_error(["--request-id", ""])
+        self.assert_input_error(["--actor", ""])
+
+    def test_find_with_verify_audit_is_input_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            self.seed(audit_file, [self.accepted("a1")])
+            cmd = [
+                sys.executable, GATEWAY, "--audit-find", "--verify-audit",
+                "--audit-file", audit_file,
+            ]
+            proc = subprocess.run(
+                cmd, stdin=subprocess.DEVNULL, capture_output=True,
+                text=True, timeout=30,
+            )
+            self.assertEqual(proc.returncode, 2)
+            self.assertEqual(
+                json.loads(proc.stderr)["error"]["type"], "InputError"
+            )
+
+    def test_filters_without_find_are_input_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            base = [sys.executable, GATEWAY, "--audit-file", audit_file]
+            for extra in (
+                ["--request-id", "r"],
+                ["--actor", "a"],
+                ["--decision", "accepted"],
+                ["--from", "2026-10-01T00:00:00Z"],
+                ["--to", "2026-10-01T00:00:00Z"],
+            ):
+                proc = subprocess.run(
+                    base + extra, stdin=subprocess.DEVNULL,
+                    capture_output=True, text=True, timeout=30,
+                )
+                self.assertEqual(proc.returncode, 2)
+                self.assertEqual(
+                    json.loads(proc.stderr)["error"]["type"], "InputError",
+                    extra,
+                )
+
+    # ---- AuditVerificationError：行非合法 JSON 对象 ------------------------
+
+    def assert_verification_error(self, content):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "bad.jsonl")
+            with open(audit_file, "w", encoding="utf-8") as fh:
+                fh.write(content)
+            proc = run_find(audit_file)
+            self.assertEqual(proc.returncode, 2)
+            self.assertEqual(proc.stdout, "")
+            err = json.loads(proc.stderr)
+            self.assertEqual(err["error"]["type"], "AuditVerificationError")
+            self.assertEqual(proc.stderr.count("\n"), 1)
+
+    def test_malformed_json_line_is_verification_error(self):
+        self.assert_verification_error("{not json\n")
+
+    def test_non_object_json_line_is_verification_error(self):
+        self.assert_verification_error('["x"]\n')
+        self.assert_verification_error('"a string"\n')
+        self.assert_verification_error("null\n")
+
+    # ---- 只读：不读 stdin、不写文件 ----------------------------------------
+
+    def test_does_not_read_stdin(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            self.seed(audit_file, [self.accepted("a1")])
+            # 即使标准输入喂入数据，检索模式也忽略它。
+            proc = run_find(audit_file, stdin=subprocess.PIPE)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(json.loads(proc.stdout)["count"], 1)
+
+    def test_find_does_not_modify_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            self.seed(audit_file, [self.accepted("a1")])
+            with open(audit_file, "rb") as fh:
+                before = fh.read()
+            run_find(audit_file, ["--actor", "alice"])
+            run_find(audit_file, ["--decision", "accepted"])
+            with open(audit_file, "rb") as fh:
+                self.assertEqual(fh.read(), before)
+
+    def test_find_on_missing_file_does_not_create_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "nope.jsonl")
+            run_find(audit_file)
+            self.assertFalse(os.path.exists(audit_file))
+
+    # ---- 与其他开关组合：均不改变检索结果 ----------------------------------
+
+    def test_audit_chain_skips_digest_verification_on_broken_chain(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            # 用含全部五个必填字段的完整记录生成合法链式行，再篡改 actor
+            # （不重算摘要 → 链断裂，但记录形态对检索仍可见）。
+            full = self.accepted("a1", actor="alice")
+            line, _ = make_chain_line(GENESIS_DIGEST, full)
+            obj = json.loads(line)
+            obj["actor"] = "tampered"
+            write_lines(audit_file, [canonical(obj)])
+            # 不带 --audit-chain：检索不校验摘要，照常读。
+            self.assert_ok(run_find(audit_file), ["a1"])
+            # 带 --audit-chain：仍跳过摘要校验，结果不变。
+            self.assert_ok(
+                run_find(audit_file, args=["--audit-chain"]), ["a1"]
+            )
+            # 对照：--verify-audit 判定同一文件确实断链。
+            verify_proc = run_verify(audit_file)
+            self.assertEqual(verify_proc.returncode, 2)
+            self.assertEqual(
+                json.loads(verify_proc.stderr)["error"]["type"],
+                "AuditVerificationError",
+            )
+
+    def test_inert_flags_do_not_change_result_or_write(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            self.seed(
+                audit_file,
+                [
+                    self.accepted("a1", actor="alice"),
+                    self.accepted("a2", actor="bob"),
+                ],
+            )
+            with open(audit_file, "rb") as fh:
+                before = fh.read()
+            args = ["--audit-chain", "--audit-errors",
+                    "--strict-types", "--check-references"]
+            proc = run_find(audit_file, ["--actor", "alice"], args=args)
+            self.assert_ok(proc, ["a1"])
+            # 不触发拒绝审计追加，也不做严格类型/引用处理。
+            with open(audit_file, "rb") as fh:
+                self.assertEqual(fh.read(), before)
+
+    def test_find_with_audit_errors_does_not_write_rejection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            self.seed(audit_file, [self.accepted("a1")])
+            with open(audit_file, "rb") as fh:
+                before = fh.read()
+            # 坏行在检索语义下是 AuditVerificationError；--audit-errors
+            # 不得因此追加任何 rejected 记录。
+            with open(audit_file, "a", encoding="utf-8") as fh:
+                fh.write("null\n")
+            proc = run_find(audit_file, args=["--audit-errors"])
+            self.assertEqual(proc.returncode, 2)
+            self.assertEqual(
+                json.loads(proc.stderr)["error"]["type"],
+                "AuditVerificationError",
+            )
+            # 文件只多出我们手写的坏行，未额外追加拒绝记录。
+            with open(audit_file, "rb") as fh:
+                self.assertEqual(fh.read(), before + b"null\n")
+
+    # ---- 端到端：真实 accepted/rejected/chain 行均可检索 -------------------
+
+    def test_finds_real_records_from_gateway_runs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            # accepted 链式行
+            good = base_request()
+            good["audit_context"] = {
+                "request_id": "req-1", "actor": "dr-house",
+                "recorded_at": "2026-10-03T10:00:00Z",
+            }
+            proc = run_chain(good, audit_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            # rejected 行（audit-errors + 非法 JSON）
+            bad = run_audit_errors(
+                None, audit_file, args=["--audit-chain"], raw="{not json"
+            )
+            self.assertEqual(bad.returncode, 2)
+            # 链仍完整
+            self.assertEqual(run_verify(audit_file).returncode, 0)
+
+            # 检索 actor=dr-house 命中 accepted 行，且带 audit_digest。
+            found = run_find(audit_file, ["--actor", "dr-house"])
+            self.assertEqual(found.returncode, 0, found.stderr)
+            body = json.loads(found.stdout)
+            self.assertEqual(body["count"], 1)
+            rec = body["records"][0]
+            self.assertEqual(rec["decision"], "accepted")
+            self.assertRegex(rec["audit_digest"], r"^[0-9a-f]{64}$")
+            self.assertNotIn("resource", rec)
+
+            # rejected 行（request_id/actor 为 null）按 decision 命中。
+            rej = run_find(audit_file, ["--decision", "rejected"])
+            rej_body = json.loads(rej.stdout)
+            self.assertEqual(rej_body["count"], 1)
+            self.assertIsNone(rej_body["records"][0]["actor"])
 
 
 class ReferenceCheckTests(unittest.TestCase):

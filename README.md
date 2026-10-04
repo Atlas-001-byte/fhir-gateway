@@ -20,6 +20,8 @@ fhir-gateway --check-references --audit-file PATH < request.json
 fhir-gateway --audit-errors --audit-file PATH < request.json
 fhir-gateway --strict-types --audit-file PATH < request.json
 fhir-gateway --verify-audit --audit-file PATH
+fhir-gateway --audit-find --audit-file PATH [--request-id ID] [--actor A] \
+  [--decision accepted|rejected] [--from YYYY-MM-DDTHH:MM:SSZ] [--to YYYY-MM-DDTHH:MM:SSZ]
 ```
 
 - `--audit-file PATH`（必需）：审计 JSON Lines 文件；文件不存在则创建，已存在则保留旧行并追加。
@@ -28,7 +30,8 @@ fhir-gateway --verify-audit --audit-file PATH
 - `--audit-errors`（可选）：请求处理失败时追加一条 `decision=rejected` 的拒绝审计记录；不开启时行为完全不变。
 - `--strict-types`（可选）：对 Patient/Observation/Condition 的已知字段收紧为 FHIR R4 类型；不开启时解析、校验、映射、输出与审计行为完全不变。
 - `--verify-audit`（可选）：只校验链式文件，不读取标准输入。
-- 请求 JSON 从标准输入读取（校验模式除外）。
+- `--audit-find`（可选）：只读检索审计 JSON Lines，不读取标准输入、不写审计、不执行校验/映射等其他功能。
+- 请求 JSON 从标准输入读取（校验模式与检索模式除外）。
 
 ## 请求格式
 
@@ -329,6 +332,57 @@ fhir-gateway --verify-audit --audit-file PATH
 - 与 `--audit-chain` 同用时拒绝记录沿用规范 JSON 与 SHA-256 链；链不合法、目标不可写或追加不完整统一返回 `AuditWriteError`（stderr 一行 JSON、退出码 `2`），原文件不变且不再记录。
 - `--verify-audit` 仍为只读、不读 stdin、不追加；与 `--audit-errors` 同用直接返回 `InputError`。
 
+## 只读审计检索（--audit-find）
+
+`--audit-find` 为只读入口：从审计 JSON Lines 文件按条件检索记录并输出，**不读取标准输入、不写审计、不执行资源校验/术语映射/引用检查等其他功能**。既有写入、链式、校验入口与行为完全不变。
+
+```sh
+fhir-gateway --audit-find --audit-file PATH [过滤项...]
+```
+
+过滤项（全部可选；多个条件**同时满足（AND）**，不带任何过滤项返回全部可见记录）：
+
+- `--request-id ID`、`--actor A`：对记录同名字段**精确匹配**（区分大小写、非子串）；参数值不能为空。
+- `--decision accepted|rejected`：精确匹配，仅接受这两个值。
+- `--from TS`、`--to TS`：按 `recorded_at` 做含边界比较（`from <= recorded_at <= to`），TS 必须为 `YYYY-MM-DDTHH:MM:SSZ`（UTC、零填充）。可只给一个。记录的 `recorded_at` 无法按该格式解析时**不命中日期过滤**；不带任何日期过滤时该行仍可正常命中。
+- 过滤项只能与 `--audit-find` 同用；在其他入口上使用属于 `InputError`。
+
+成功时退出码 `0`，stdout 一行 JSON，顶层字段顺序固定为 `count`、`records`；无命中为空数组：
+
+```json
+{"count": 0, "records": []}
+```
+
+- `records` 严格保持文件中的**行序**，**不去重**（相同 `audit_id` 的多行各自保留）。
+- `count` 等于 `records` 的长度。
+
+可见记录的形态（否则该行**跳过且不计入 count**，不报错）：
+
+- 必须是 JSON 对象；
+- `audit_id`、`decision` 必须为**非空字符串**；
+- `request_id`、`actor`、`recorded_at` 三个键必须存在：普通记录为字符串；`--audit-errors` 产生的拒绝记录在 `audit_context` 缺失时这三项为 `null`，仍属可见；
+- 缺任一字段、字段类型不符（数字、布尔、数组、对象）或 `audit_id` 为空的行一律跳过。
+
+输出只展示安全字段，**保持每条记录原有的字段顺序**，并且**不复制 `resource`、`term_maps`、任何引用值、`message` 或请求正文**（这些键被剔除）；其余审计字段原样保留，包括：
+
+- 普通行的 `request_id`、`actor`、`recorded_at`、`decision`、`audit_id`；
+- 链式行的 `audit_digest`（仅只读展示，**不复核摘要**）；
+- transaction/batch 批量摘要（`bundle_type`、`entry_total`、`entries` 等）；
+- 拒绝记录的 `error_type`、`phase`、`status`（其 `request_id`/`actor`/`recorded_at` 可能为 `null`）。
+
+与其他开关同用（均不改变检索结果，也不触发其副作用）：
+
+- `--audit-chain`：**跳过摘要链校验**，链式行、断链文件都按普通 JSON Lines 只读展示（是否被篡改不影响检索）。
+- `--audit-errors`：检索过程中遇到坏行等错误时**不写拒绝审计**。
+- `--strict-types`、`--check-references`：不做类型收紧或引用检查，结果与不加这些开关完全一致。
+- `--verify-audit`：与 `--audit-find` 互斥，同用返回 `InputError`。
+
+错误（三类均 **stdout 为空**、stderr 一行 JSON、退出码 `2`、**不写任何文件**）：
+
+- `AuditReadError`：缺少 `--audit-file`、文件不存在、路径为目录、父目录不存在或读取失败；缺失文件也**不会被创建**。
+- `InputError`：过滤项取值非法（`--decision` 非 `accepted`/`rejected`、过滤值为空）、`--from`/`--to` 时间格式非法、过滤项出现在非检索入口、或与 `--verify-audit` 同用。
+- `AuditVerificationError`：文件中某一行不是合法 JSON **对象**（JSON 解析失败或解析结果为数组/字符串/数字/布尔/`null`）。注意：字段缺失/类型不符/`audit_id` 为空只跳过该行，不属于本错误。
+
 ## 错误输出
 
 任意受控错误：**stdout 为空**，stderr 一行 JSON，退出码 `2`，且**不写审计文件**（开启 `--audit-errors` 时按上节追加拒绝记录）：
@@ -339,12 +393,12 @@ fhir-gateway --verify-audit --audit-file PATH
 
 | 错误类型 | 触发场景 |
 | --- | --- |
-| `InputError` | 标准输入不是合法 JSON、请求结构非法、缺少字段、`audit_context` 非法 |
+| `InputError` | 标准输入不是合法 JSON、请求结构非法、缺少字段、`audit_context` 非法；`--audit-find` 时过滤值非法（`--decision` 取值越界、过滤值为空）、`--from`/`--to` 时间格式非法、过滤项脱离 `--audit-find` 使用、或 `--audit-find` 与 `--verify-audit` 同用 |
 | `FhirValidationError` | 资源类型/id/status/编码不满足校验规则；开启 `--strict-types` 时已知字段为 `null`、形状错误、数字代字符串、日期非法或出现多个 `value[x]`；开启 `--check-references` 时引用缺少本地目标、目标重复、`reference` 非法或形式不受支持 |
 | `TermMappingError` | 映射项字段非法，或同一源编码存在多个不同目标（transaction/batch 中降级为逐项 `processing`） |
-| `AuditWriteError` | 缺少 `--audit-file`、路径为目录、父目录不存在、无权限或追加写入不完整；链式模式下目标文件存在非链式行、摘要不匹配、重复 `audit_id`、缺字段或非对象行；此时 stdout 为空 |
-| `AuditReadError` | `--verify-audit` 时文件缺失、路径为目录、父目录不存在或读取失败 |
-| `AuditVerificationError` | `--verify-audit` 时 JSON 解析失败、行非对象、`audit_digest` 缺失/格式错误、`audit_id` 为空/重复或摘要链断裂 |
+| `AuditWriteError` | 写入/校验/普通处理入口缺少 `--audit-file`、路径为目录、父目录不存在、无权限或追加写入不完整；链式模式下目标文件存在非链式行、摘要不匹配、重复 `audit_id`、缺字段或非对象行；此时 stdout 为空 |
+| `AuditReadError` | `--verify-audit` 时文件缺失、路径为目录、父目录不存在或读取失败；`--audit-find` 时除上述读取问题外，连缺少 `--audit-file` 也归入本类型（其他入口缺少该参数仍为 `AuditWriteError`） |
+| `AuditVerificationError` | `--verify-audit` 时 JSON 解析失败、行非对象、`audit_digest` 缺失/格式错误、`audit_id` 为空/重复或摘要链断裂；`--audit-find` 时某一行不是合法 JSON 对象（解析失败或解析结果非对象） |
 
 > 注：审计在 stdout 输出之前落盘，因此 `AuditWriteError` 发生时 stdout 保证为空。
 
@@ -356,7 +410,7 @@ python3 test_fhir_gateway.py
 
 ## 状态
 
-已实现 `fhir-gateway`：资源校验、术语映射、审计留痕端到端可用，支持单资源与 FHIR R4 Bundle；transaction/batch Bundle 支持批量执行语义（逐项校验与映射、transaction-response/batch-response、全有或全无/逐项独立、逐项审计）；`--audit-chain` 提供基于 SHA-256 的审计完整性链，`--verify-audit` 支持离线复核；`--check-references` 提供可选的本地引用完整性校验（片段 contained 解析、非执行 Bundle 跨 entry 唯一解析、外部引用仅校验形式）；`--audit-errors` 提供可选的拒绝审计（rejected 记录、按阶段归类、链式兼容）；`--strict-types` 提供可选的 FHIR R4 已知字段类型收紧（Patient/Observation/Condition、null 与形状拒绝、日期/枚举校验、value[x] 唯一、批量 processing、与其他开关组合），含 149 个端到端测试。
+已实现 `fhir-gateway`：资源校验、术语映射、审计留痕端到端可用，支持单资源与 FHIR R4 Bundle；transaction/batch Bundle 支持批量执行语义（逐项校验与映射、transaction-response/batch-response、全有或全无/逐项独立、逐项审计）；`--audit-chain` 提供基于 SHA-256 的审计完整性链，`--verify-audit` 支持离线复核；`--check-references` 提供可选的本地引用完整性校验（片段 contained 解析、非执行 Bundle 跨 entry 唯一解析、外部引用仅校验形式）；`--audit-errors` 提供可选的拒绝审计（rejected 记录、按阶段归类、链式兼容）；`--strict-types` 提供可选的 FHIR R4 已知字段类型收紧（Patient/Observation/Condition、null 与形状拒绝、日期/枚举校验、value[x] 唯一、批量 processing、与其他开关组合）；`--audit-find` 提供只读审计检索（request_id/actor/decision 精确匹配、recorded_at 含边界时间窗、AND 组合、字段缺失跳过、行序保留不去重、敏感字段剔除、链式行/拒绝记录/批量摘要只读展示，缺文件为 AuditReadError、非法参数为 InputError、坏行为 AuditVerificationError，与其他开关同用不改变结果），含 187 个端到端测试。
 
 ## 约定
 

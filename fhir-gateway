@@ -8,6 +8,11 @@
     fhir-gateway --audit-errors --audit-file PATH < request.json
     fhir-gateway --strict-types --audit-file PATH < request.json
     fhir-gateway --verify-audit --audit-file PATH
+    fhir-gateway --audit-find --audit-file PATH [--request-id ID]
+                                                 [--actor A]
+                                                 [--decision accepted|rejected]
+                                                 [--from YYYY-MM-DDTHH:MM:SSZ]
+                                                 [--to YYYY-MM-DDTHH:MM:SSZ]
 
 仅使用 Python 标准库，从零实现，不依赖任何外部 FHIR/术语库。
 支持单个 Patient/Observation/Condition，或 FHIR R4 Bundle（含若干 entry 资源）。
@@ -29,6 +34,12 @@ recorded_at、decision、audit_id、error_type、phase、status；audit_context
 已知字段校验 JSON 类型与日期/枚举格式（未知字段原样保留）；单资源、非执行
 Bundle 的 entry.resource 与 transaction/batch 逐项均覆盖，批量中严格失败记
 processing；不开启时行为完全不变。
+--audit-find 只读检索审计 JSON Lines，不读 stdin、不写审计、不执行其他功能。
+可按 --request-id、--actor（精确匹配）、--decision（accepted/rejected）与
+--from/--to（按 recorded_at 含边界，YYYY-MM-DDTHH:MM:SSZ）过滤，条件同时
+满足，空条件返回全部；输出一行 {"count": N, "records": [...]}，保持行序不去
+重，仅展示安全字段。--audit-chain/--audit-errors/--strict-types/
+--check-references 与本模式同用时不改变检索结果；--verify-audit 与其互斥。
 """
 
 import datetime
@@ -1054,13 +1065,151 @@ def verify_audit_file(path):
     }
 
 
+# --- --audit-find：只读审计检索 ---------------------------------------------
+
+# --from/--to 与可比较的 recorded_at 均采用固定形状 YYYY-MM-DDTHH:MM:SSZ。
+FIND_TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+
+# 仅这两个字段在任何审计记录中都必须是非空字符串；拒绝记录的
+# request_id/actor/recorded_at 在 audit_context 缺失时为 null，故允许字符串或
+# null（键必须存在；数字/布尔/数组/对象属类型不符，跳过）。
+FIND_NONEMPTY_STR_FIELDS = ("audit_id", "decision")
+FIND_NULLABLE_STR_FIELDS = ("request_id", "actor", "recorded_at")
+
+# 检索结果只不复制请求正文与敏感内容：resource/term_maps 为请求正文，
+# message 为错误正文；引用值只可能出现在 resource 内，随之排除。其余审计
+# 字段（含 audit_digest、error_type/phase/status、批量摘要与 entries）按原
+# 字段顺序保留。
+FIND_FORBIDDEN_KEYS = frozenset(("resource", "term_maps", "message"))
+
+FIND_DECISIONS = ("accepted", "rejected")
+
+
+def _parse_find_timestamp(value):
+    """严格解析 YYYY-MM-DDTHH:MM:SSZ 为 UTC aware datetime；不可解析返回 None。"""
+    if not isinstance(value, str) or not FIND_TIMESTAMP_RE.fullmatch(value):
+        return None
+    try:
+        return datetime.datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=datetime.timezone.utc
+        )
+    except ValueError:
+        return None
+
+
+def _is_find_record(obj):
+    """检索可见记录：对象、五个字段齐全且类型符合；否则跳过（不计 count）。"""
+    if not isinstance(obj, dict):
+        return False
+    for field in FIND_NONEMPTY_STR_FIELDS:
+        value = obj.get(field)
+        if not isinstance(value, str) or value == "":
+            return False
+    for field in FIND_NULLABLE_STR_FIELDS:
+        if field not in obj:
+            return False
+        if not isinstance(obj[field], (str, type(None))):
+            return False
+    return True
+
+
+def _find_record_matches(obj, filters):
+    """所有给定条件同时满足才命中；request_id/actor/decision 精确匹配，
+    recorded_at 按 [from, to] 含边界比较，记录时间不可解析则不命中日期过滤。"""
+    if filters["request_id"] is not None:
+        if obj.get("request_id") != filters["request_id"]:
+            return False
+    if filters["actor"] is not None:
+        if obj.get("actor") != filters["actor"]:
+            return False
+    if filters["decision"] is not None:
+        if obj.get("decision") != filters["decision"]:
+            return False
+
+    dt_from = filters["from"]
+    dt_to = filters["to"]
+    if dt_from is not None or dt_to is not None:
+        recorded = _parse_find_timestamp(obj.get("recorded_at"))
+        if recorded is None:
+            return False
+        if dt_from is not None and recorded < dt_from:
+            return False
+        if dt_to is not None and recorded > dt_to:
+            return False
+    return True
+
+
+def _public_find_record(obj):
+    """按原字段顺序复制可展示字段，剔除 resource/term_maps/message。"""
+    return {
+        key: value
+        for key, value in obj.items()
+        if key not in FIND_FORBIDDEN_KEYS
+    }
+
+
+def find_audit_records(path, filters):
+    """只读遍历 JSON Lines 审计并按条件筛选，保持行序、不去重。
+
+    文件缺失、目录、父目录不存在或读取失败为 AuditReadError；任一行不是合法
+    JSON 对象为 AuditVerificationError；字段缺失/类型不符/audit_id 为空的行
+    跳过且不计 count。不读取标准输入、不写审计。
+    """
+    text = _read_chain_file(path, must_exist=True)
+
+    records = []
+    for line_no, line in enumerate(text.splitlines(), start=1):
+        if line == "":
+            raise AuditVerificationError(
+                "第 %d 行不是合法 JSON 对象: %s" % (line_no, path)
+            )
+        try:
+            obj = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            raise AuditVerificationError(
+                "第 %d 行不是合法 JSON 对象: %s" % (line_no, path)
+            )
+        if not isinstance(obj, dict):
+            raise AuditVerificationError(
+                "第 %d 行不是合法 JSON 对象: %s" % (line_no, path)
+            )
+        if not _is_find_record(obj):
+            continue
+        if _find_record_matches(obj, filters):
+            records.append(_public_find_record(obj))
+
+    return {"count": len(records), "records": records}
+
+
 def parse_args(argv):
     audit_path = None
     chained = False
     verify = False
+    find = False
     check_references = False
     audit_errors = False
     strict_types = False
+    filters = {
+        "request_id": None,
+        "actor": None,
+        "decision": None,
+        "from": None,
+        "to": None,
+    }
+
+    def require_value(flag, i):
+        if i + 1 >= len(argv):
+            raise InputError("%s 缺少参数值" % flag)
+        return argv[i + 1]
+
+    def require_nonempty(flag, value):
+        if value == "":
+            raise InputError("%s 参数值不能为空" % flag)
+        return value
+
+    # --audit-file 缺值/空值与完全缺参一样留到循环结束后，按入口类型归类。
+    audit_file_missing = False
+
     i = 0
     while i < len(argv):
         arg = argv[i]
@@ -1069,13 +1218,15 @@ def parse_args(argv):
             sys.exit(0)
         elif arg == "--audit-file":
             if i + 1 >= len(argv):
-                raise AuditWriteError("--audit-file 缺少文件路径参数")
+                audit_file_missing = True
+                i += 1
+                continue
             audit_path = argv[i + 1]
+            audit_file_missing = False
             i += 2
         elif arg.startswith("--audit-file="):
             audit_path = arg[len("--audit-file=") :]
-            if audit_path == "":
-                raise AuditWriteError("--audit-file 缺少文件路径参数")
+            audit_file_missing = audit_path == ""
             i += 1
         elif arg == "--audit-chain":
             chained = True
@@ -1092,10 +1243,90 @@ def parse_args(argv):
         elif arg == "--verify-audit":
             verify = True
             i += 1
+        elif arg == "--audit-find":
+            find = True
+            i += 1
+        elif arg == "--request-id":
+            filters["request_id"] = require_nonempty(
+                "--request-id", require_value("--request-id", i)
+            )
+            i += 2
+        elif arg.startswith("--request-id="):
+            filters["request_id"] = require_nonempty(
+                "--request-id", arg[len("--request-id=") :]
+            )
+            i += 1
+        elif arg == "--actor":
+            filters["actor"] = require_nonempty(
+                "--actor", require_value("--actor", i)
+            )
+            i += 2
+        elif arg.startswith("--actor="):
+            filters["actor"] = require_nonempty(
+                "--actor", arg[len("--actor=") :]
+            )
+            i += 1
+        elif arg == "--decision":
+            decision = require_value("--decision", i)
+            if decision not in FIND_DECISIONS:
+                raise InputError(
+                    "--decision 仅限 accepted/rejected，实际为 %s"
+                    % json.dumps(decision, ensure_ascii=False)
+                )
+            filters["decision"] = decision
+            i += 2
+        elif arg.startswith("--decision="):
+            decision = arg[len("--decision=") :]
+            if decision not in FIND_DECISIONS:
+                raise InputError(
+                    "--decision 仅限 accepted/rejected，实际为 %s"
+                    % json.dumps(decision, ensure_ascii=False)
+                )
+            filters["decision"] = decision
+            i += 1
+        elif arg == "--from":
+            value = require_value("--from", i)
+            if _parse_find_timestamp(value) is None:
+                raise InputError(
+                    "--from 必须为 YYYY-MM-DDTHH:MM:SSZ 格式，实际为 %s"
+                    % json.dumps(value, ensure_ascii=False)
+                )
+            filters["from"] = _parse_find_timestamp(value)
+            i += 2
+        elif arg.startswith("--from="):
+            value = arg[len("--from=") :]
+            if _parse_find_timestamp(value) is None:
+                raise InputError(
+                    "--from 必须为 YYYY-MM-DDTHH:MM:SSZ 格式，实际为 %s"
+                    % json.dumps(value, ensure_ascii=False)
+                )
+            filters["from"] = _parse_find_timestamp(value)
+            i += 1
+        elif arg == "--to":
+            value = require_value("--to", i)
+            if _parse_find_timestamp(value) is None:
+                raise InputError(
+                    "--to 必须为 YYYY-MM-DDTHH:MM:SSZ 格式，实际为 %s"
+                    % json.dumps(value, ensure_ascii=False)
+                )
+            filters["to"] = _parse_find_timestamp(value)
+            i += 2
+        elif arg.startswith("--to="):
+            value = arg[len("--to=") :]
+            if _parse_find_timestamp(value) is None:
+                raise InputError(
+                    "--to 必须为 YYYY-MM-DDTHH:MM:SSZ 格式，实际为 %s"
+                    % json.dumps(value, ensure_ascii=False)
+                )
+            filters["to"] = _parse_find_timestamp(value)
+            i += 1
         else:
             raise AuditWriteError("未知参数: %s" % arg)
 
-    if audit_path is None:
+    if audit_path is None or audit_file_missing:
+        if find:
+            # 只读检索缺 --audit-file（含取值缺失/为空）与文件不可读同属读取侧错误。
+            raise AuditReadError("缺少必需参数 --audit-file")
         raise AuditWriteError("缺少必需参数 --audit-file")
     if verify and audit_errors:
         # 校验模式只读、不追加，与拒绝审计互斥。
@@ -1103,7 +1334,31 @@ def parse_args(argv):
     if verify and strict_types:
         # 校验模式只读、不读 stdin、不追加，与严格类型校验互斥。
         raise InputError("--verify-audit 不能与 --strict-types 同用")
-    return audit_path, chained, verify, check_references, audit_errors, strict_types
+    if find and verify:
+        # 检索与离线校验为两个独立只读入口，不可同用。
+        raise InputError("--audit-find 不能与 --verify-audit 同用")
+    if not find:
+        # 过滤参数仅属于 --audit-find，其他入口不接受。
+        used = [
+            name
+            for name in ("request_id", "actor", "decision", "from", "to")
+            if filters[name] is not None
+        ]
+        if used:
+            raise InputError(
+                "%s 只能与 --audit-find 同用"
+                % "、".join("--" + name.replace("_", "-") for name in used)
+            )
+    return (
+        audit_path,
+        chained,
+        verify,
+        find,
+        check_references,
+        audit_errors,
+        strict_types,
+        filters,
+    )
 
 
 def process(
@@ -1191,9 +1446,11 @@ def main(argv):
             audit_path,
             chained,
             verify,
+            find,
             check_references,
             audit_errors,
             strict_types,
+            filters,
         ) = parse_args(argv)
     except GatewayError as exc:
         _emit_error(exc)
@@ -1203,6 +1460,18 @@ def main(argv):
         # 仅校验链式文件，不读取标准输入。
         try:
             result = verify_audit_file(audit_path)
+        except GatewayError as exc:
+            _emit_error(exc)
+            return 2
+        sys.stdout.write(json.dumps(result, ensure_ascii=False) + "\n")
+        sys.stdout.flush()
+        return 0
+
+    if find:
+        # 只读检索：不读 stdin、不写审计、不执行校验/映射；--audit-chain、
+        # --audit-errors、--strict-types、--check-references 同用不影响结果。
+        try:
+            result = find_audit_records(audit_path, filters)
         except GatewayError as exc:
             _emit_error(exc)
             return 2

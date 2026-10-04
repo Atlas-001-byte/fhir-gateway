@@ -2631,5 +2631,376 @@ class StrictTypesPrecedenceAndComboTests(unittest.TestCase):
             self.assertFalse(os.path.exists(audit_file))
 
 
+def run_find(audit_file, filters=None, extra_args=None, stdin=subprocess.DEVNULL):
+    """检索模式：默认不接管道（DEVNULL），顺带验证其不读取标准输入。"""
+    cmd = [sys.executable, GATEWAY, "--audit-find", "--audit-file", audit_file]
+    if filters:
+        cmd += filters
+    if extra_args:
+        cmd += extra_args
+    return subprocess.run(
+        cmd, stdin=stdin, capture_output=True, text=True, timeout=30
+    )
+
+
+def find_record(
+    request_id="req-1",
+    actor="dr-house",
+    recorded_at="2026-10-03T10:00:00Z",
+    decision="accepted",
+    audit_id="a1",
+    **extra
+):
+    record = {
+        "request_id": request_id,
+        "actor": actor,
+        "recorded_at": recorded_at,
+        "decision": decision,
+        "audit_id": audit_id,
+    }
+    record.update(extra)
+    return record
+
+
+def seed_find_file(path, records):
+    write_lines(path, [json.dumps(r, ensure_ascii=False) for r in records])
+
+
+class AuditFindTests(unittest.TestCase):
+    def assert_find_error(self, proc, expected):
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(proc.stdout, "")
+        # stderr 恰好一行 JSON。
+        self.assertEqual(proc.stderr.count("\n"), 1)
+        err = json.loads(proc.stderr)
+        self.assertEqual(err["error"]["type"], expected)
+        self.assertTrue(err["error"]["message"])
+
+    def assert_find_ok(self, proc):
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stderr, "")
+        body = json.loads(proc.stdout)
+        # 顶层字段顺序固定为 count、records。
+        self.assertEqual(list(body.keys()), ["count", "records"])
+        self.assertEqual(body["count"], len(body["records"]))
+        return body
+
+    def test_no_filters_returns_all_records_in_order_without_dedup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            records = [
+                find_record(),
+                find_record(
+                    request_id="req-2",
+                    actor="dr-who",
+                    decision="rejected",
+                    audit_id="a2",
+                    error_type="InputError",
+                    phase="request",
+                    status=400,
+                ),
+                find_record(),  # 完全重复的行不去重
+            ]
+            seed_find_file(audit_file, records)
+            body = self.assert_find_ok(run_find(audit_file))
+            self.assertEqual(body["count"], 3)
+            self.assertEqual(body["records"], records)
+
+    def test_record_field_order_preserved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            # 手写一行，键序与 find_record 的构造顺序不同。
+            write_lines(
+                audit_file,
+                [
+                    '{"audit_id": "z9", "status": 200, "decision": "accepted",'
+                    ' "recorded_at": "2026-10-03T10:00:00Z", "actor": "a",'
+                    ' "request_id": "r"}'
+                ],
+            )
+            body = self.assert_find_ok(run_find(audit_file))
+            self.assertEqual(
+                list(body["records"][0].keys()),
+                [
+                    "audit_id",
+                    "status",
+                    "decision",
+                    "recorded_at",
+                    "actor",
+                    "request_id",
+                ],
+            )
+
+    def test_empty_result_is_zero_count_empty_records(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            seed_find_file(audit_file, [find_record()])
+            body = self.assert_find_ok(
+                run_find(audit_file, ["--request-id", "nobody"])
+            )
+            self.assertEqual(body, {"count": 0, "records": []})
+
+    def test_empty_file_is_zero_count(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "empty.jsonl")
+            open(audit_file, "w").close()
+            body = self.assert_find_ok(run_find(audit_file))
+            self.assertEqual(body, {"count": 0, "records": []})
+
+    def test_request_id_and_actor_are_exact_match(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            seed_find_file(
+                audit_file,
+                [
+                    find_record(request_id="req-1", actor="dr-house", audit_id="a1"),
+                    find_record(request_id="req-10", actor="dr-house jr", audit_id="a2"),
+                ],
+            )
+            # 精确匹配：req-1 不命中 req-10，dr-house 不命中 dr-house jr。
+            body = self.assert_find_ok(
+                run_find(audit_file, ["--request-id", "req-1"])
+            )
+            self.assertEqual([r["audit_id"] for r in body["records"]], ["a1"])
+            body = self.assert_find_ok(run_find(audit_file, ["--actor", "dr-house"]))
+            self.assertEqual([r["audit_id"] for r in body["records"]], ["a1"])
+
+    def test_decision_filter(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            seed_find_file(
+                audit_file,
+                [
+                    find_record(decision="accepted", audit_id="a1"),
+                    find_record(decision="rejected", audit_id="a2"),
+                ],
+            )
+            body = self.assert_find_ok(
+                run_find(audit_file, ["--decision", "rejected"])
+            )
+            self.assertEqual([r["audit_id"] for r in body["records"]], ["a2"])
+            body = self.assert_find_ok(
+                run_find(audit_file, ["--decision", "accepted"])
+            )
+            self.assertEqual([r["audit_id"] for r in body["records"]], ["a1"])
+
+    def test_from_to_inclusive_bounds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            seed_find_file(
+                audit_file,
+                [
+                    find_record(recorded_at="2026-10-03T09:59:59Z", audit_id="before"),
+                    find_record(recorded_at="2026-10-03T10:00:00Z", audit_id="at-from"),
+                    find_record(recorded_at="2026-10-04T12:00:00Z", audit_id="middle"),
+                    find_record(recorded_at="2026-10-05T00:00:00Z", audit_id="at-to"),
+                    find_record(recorded_at="2026-10-05T00:00:01Z", audit_id="after"),
+                ],
+            )
+            body = self.assert_find_ok(
+                run_find(
+                    audit_file,
+                    ["--from", "2026-10-03T10:00:00Z", "--to", "2026-10-05T00:00:00Z"],
+                )
+            )
+            # 边界含端点。
+            self.assertEqual(
+                [r["audit_id"] for r in body["records"]],
+                ["at-from", "middle", "at-to"],
+            )
+            body = self.assert_find_ok(
+                run_find(audit_file, ["--from", "2026-10-04T00:00:00Z"])
+            )
+            self.assertEqual(
+                [r["audit_id"] for r in body["records"]],
+                ["middle", "at-to", "after"],
+            )
+            body = self.assert_find_ok(
+                run_find(audit_file, ["--to", "2026-10-03T10:00:00Z"])
+            )
+            self.assertEqual(
+                [r["audit_id"] for r in body["records"]], ["before", "at-from"]
+            )
+
+    def test_unparseable_recorded_at_skipped_only_with_date_filter(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            seed_find_file(
+                audit_file,
+                [
+                    find_record(recorded_at="not-a-time", audit_id="bad-time"),
+                    find_record(recorded_at="2026-10-03T10:00:00Z", audit_id="ok"),
+                ],
+            )
+            # 无日期过滤时无法解析的记录仍可命中。
+            body = self.assert_find_ok(run_find(audit_file))
+            self.assertEqual(body["count"], 2)
+            # 有日期过滤时不命中。
+            body = self.assert_find_ok(
+                run_find(audit_file, ["--from", "2026-01-01T00:00:00Z"])
+            )
+            self.assertEqual([r["audit_id"] for r in body["records"]], ["ok"])
+
+    def test_incomplete_lines_skipped_and_not_counted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            good = find_record(audit_id="good")
+            lines = [
+                json.dumps(find_record(audit_id="good")),
+                json.dumps({"audit_id": "only-id"}),  # 缺字段
+                json.dumps(find_record(audit_id="")),  # audit_id 为空
+                json.dumps(find_record(audit_id="x", decision="")),  # 字段为空
+                json.dumps(find_record(audit_id=123)),  # 类型不符
+                json.dumps(find_record(actor=None)),  # 类型不符
+            ]
+            write_lines(audit_file, lines)
+            body = self.assert_find_ok(run_find(audit_file))
+            self.assertEqual(body, {"count": 1, "records": [good]})
+
+    def test_non_object_line_is_verification_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "bad.jsonl")
+            write_lines(audit_file, ['["not", "object"]'])
+            self.assert_find_error(run_find(audit_file), "AuditVerificationError")
+
+    def test_invalid_json_line_is_verification_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "bad.jsonl")
+            write_lines(audit_file, ["{not json"])
+            self.assert_find_error(run_find(audit_file), "AuditVerificationError")
+
+    def test_missing_audit_file_arg_is_read_error(self):
+        proc = subprocess.run(
+            [sys.executable, GATEWAY, "--audit-find"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assert_find_error(proc, "AuditReadError")
+
+    def test_missing_file_is_read_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assert_find_error(
+                run_find(os.path.join(tmp, "nope.jsonl")), "AuditReadError"
+            )
+
+    def test_directory_is_read_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assert_find_error(run_find(tmp), "AuditReadError")
+
+    def test_missing_parent_is_read_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assert_find_error(
+                run_find(os.path.join(tmp, "nodir", "x.jsonl")), "AuditReadError"
+            )
+
+    def test_bad_decision_value_is_input_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            seed_find_file(audit_file, [find_record()])
+            for value in ("maybe", "Accepted", ""):
+                self.assert_find_error(
+                    run_find(audit_file, ["--decision", value]), "InputError"
+                )
+
+    def test_bad_time_format_is_input_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            seed_find_file(audit_file, [find_record()])
+            for value in (
+                "2026-10-03",
+                "2026-10-03 10:00:00Z",
+                "2026-10-03T10:00:00",  # 缺 Z
+                "2026-10-03T10:00:00+00:00",
+                "2026-13-01T00:00:00Z",  # 日历非法
+                "2026-10-03T25:00:00Z",  # 时间非法
+            ):
+                self.assert_find_error(
+                    run_find(audit_file, ["--from", value]), "InputError"
+                )
+                self.assert_find_error(
+                    run_find(audit_file, ["--to", value]), "InputError"
+                )
+
+    def test_filters_without_find_is_input_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            proc = run(
+                base_request(), audit_file, args=["--request-id", "req-1"]
+            )
+            self.assert_find_error(proc, "InputError")
+
+    def test_find_with_verify_is_input_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            seed_find_file(audit_file, [find_record()])
+            self.assert_find_error(
+                run_find(audit_file, extra_args=["--verify-audit"]), "InputError"
+            )
+
+    def test_find_with_chain_skips_digest_verification(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "chain.jsonl")
+            # 种一条合法链，再篡改第二行正文使链断裂。
+            r1 = find_record(audit_id="c1")
+            r2 = find_record(audit_id="c2", request_id="req-2")
+            l1, d1 = make_chain_line(GENESIS_DIGEST, r1)
+            l2, _ = make_chain_line(d1, r2)
+            tampered = json.loads(l2)
+            tampered["actor"] = "tampered"
+            write_lines(audit_file, [l1, canonical(tampered)])
+            # --verify-audit 会断链，--audit-find 只读展示、跳过摘要校验。
+            self.assertEqual(run_verify(audit_file).returncode, 2)
+            body = self.assert_find_ok(run_find(audit_file, ["--audit-chain"]))
+            self.assertEqual(body["count"], 2)
+            self.assertEqual(body["records"][1]["actor"], "tampered")
+            self.assertIn("audit_digest", body["records"][0])
+
+    def test_find_with_audit_errors_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            seed_find_file(audit_file, [find_record()])
+            before = open(audit_file, "rb").read()
+            body = self.assert_find_ok(run_find(audit_file, ["--audit-errors"]))
+            self.assertEqual(body["count"], 1)
+            self.assertEqual(open(audit_file, "rb").read(), before)
+
+    def test_find_with_strict_and_check_references_unchanged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            seed_find_file(audit_file, [find_record(), find_record(audit_id="a2")])
+            plain = self.assert_find_ok(run_find(audit_file))
+            combo = self.assert_find_ok(
+                run_find(audit_file, ["--strict-types", "--check-references"])
+            )
+            self.assertEqual(plain, combo)
+
+    def test_does_not_read_stdin_and_does_not_modify_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            seed_find_file(audit_file, [find_record()])
+            before = open(audit_file, "rb").read()
+            # 即使标准输入喂入数据，检索模式也忽略它。
+            body = self.assert_find_ok(run_find(audit_file, stdin=subprocess.PIPE))
+            self.assertEqual(body["count"], 1)
+            self.assertEqual(open(audit_file, "rb").read(), before)
+
+    def test_non_ascii_and_equals_form(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            seed_find_file(
+                audit_file, [find_record(actor="豪斯医生", request_id="请求-1")]
+            )
+            proc = run_find(
+                audit_file, ["--actor=豪斯医生", "--request-id=请求-1"]
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            # 非 ASCII 原样输出，不转义。
+            self.assertIn("豪斯医生", proc.stdout)
+            body = json.loads(proc.stdout)
+            self.assertEqual(body["count"], 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

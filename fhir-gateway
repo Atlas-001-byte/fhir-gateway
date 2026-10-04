@@ -8,6 +8,8 @@
     fhir-gateway --audit-errors --audit-file PATH < request.json
     fhir-gateway --strict-types --audit-file PATH < request.json
     fhir-gateway --verify-audit --audit-file PATH
+    fhir-gateway --audit-find --audit-file PATH [--request-id ID] [--actor A]
+                 [--decision accepted|rejected] [--from TS] [--to TS]
 
 仅使用 Python 标准库，从零实现，不依赖任何外部 FHIR/术语库。
 支持单个 Patient/Observation/Condition，或 FHIR R4 Bundle（含若干 entry 资源）。
@@ -29,6 +31,14 @@ recorded_at、decision、audit_id、error_type、phase、status；audit_context
 已知字段校验 JSON 类型与日期/枚举格式（未知字段原样保留）；单资源、非执行
 Bundle 的 entry.resource 与 transaction/batch 逐项均覆盖，批量中严格失败记
 processing；不开启时行为完全不变。
+--audit-find 为只读审计检索：逐行读取 --audit-file（JSON Lines），不读
+stdin、不写审计、不执行其他功能。--request-id/--actor 精确匹配，--decision
+仅限 accepted/rejected，--from/--to 按 recorded_at 含边界过滤（值须为
+YYYY-MM-DDTHH:MM:SSZ；记录时间无法解析时不命中日期过滤，无日期过滤仍可
+命中）。全部条件同时满足才命中；空条件返回全部记录，保持行序、不去重。
+记录须为含非空 audit_id/decision/request_id/actor/recorded_at 的对象，
+否则跳过且不计 count；非合法 JSON 对象的行返回 AuditVerificationError。
+stdout 输出一行 {"count": N, "records": [...]}，记录字段顺序保持不变。
 """
 
 import datetime
@@ -1054,6 +1064,89 @@ def verify_audit_file(path):
     }
 
 
+# --- --audit-find：只读审计检索 ----------------------------------------------
+
+# 命中记录必须同时具备的非空字符串字段；缺失/类型不符/为空则跳过且不计 count。
+FIND_REQUIRED_FIELDS = ("audit_id", "decision", "request_id", "actor", "recorded_at")
+
+# --decision 过滤仅接受这两个值。
+FIND_DECISIONS = ("accepted", "rejected")
+
+# --from/--to 过滤值：YYYY-MM-DDTHH:MM:SSZ（UTC 时刻，含边界）。
+FIND_BOUND_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+
+
+def _parse_find_bound(value, label):
+    """解析 --from/--to 过滤值；形状或日历/时间非法均为 InputError。"""
+    try:
+        if not FIND_BOUND_RE.fullmatch(value):
+            raise ValueError("形状不符")
+        # 拒绝 13 月、02-30、25:00:00 等形状合法但日历/时间非法的值。
+        return datetime.datetime.fromisoformat(value[:-1] + "+00:00")
+    except (ValueError, TypeError):
+        raise InputError(
+            "%s 必须为 YYYY-MM-DDTHH:MM:SSZ 格式的合法时间，实际为 %s"
+            % (label, json.dumps(value, ensure_ascii=False))
+        )
+
+
+def _parse_recorded_at(value):
+    """尽力把记录的 recorded_at 解析为可比较的带时区时间；失败返回 None。"""
+    if not isinstance(value, str) or not DATETIME_RE.fullmatch(value):
+        return None
+    candidate = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        parsed = datetime.datetime.fromisoformat(candidate)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        # 无时区的记录时间无法与 UTC 边界比较，视为无法解析。
+        return None
+    return parsed
+
+
+def find_audit_records(
+    path, request_id=None, actor=None, decision=None, from_bound=None, to_bound=None
+):
+    """只读检索审计 JSON Lines：全部条件同时满足才命中，保持行序、不去重。
+
+    非合法 JSON 对象的行抛 AuditVerificationError；字段缺失/类型不符/为空的
+    行跳过且不计 count。不做摘要链校验，也不写入任何文件。
+    """
+    text = _read_chain_file(path, must_exist=True)
+    records = []
+    for line in text.splitlines():
+        try:
+            obj = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            raise AuditVerificationError(
+                "审计检索发现非合法 JSON 对象的行: %s" % path
+            )
+        if not isinstance(obj, dict):
+            raise AuditVerificationError(
+                "审计检索发现非合法 JSON 对象的行: %s" % path
+            )
+        if not all(_is_nonempty_str(obj.get(field)) for field in FIND_REQUIRED_FIELDS):
+            continue
+        if request_id is not None and obj["request_id"] != request_id:
+            continue
+        if actor is not None and obj["actor"] != actor:
+            continue
+        if decision is not None and obj["decision"] != decision:
+            continue
+        if from_bound is not None or to_bound is not None:
+            recorded = _parse_recorded_at(obj["recorded_at"])
+            if recorded is None:
+                # 记录时间无法解析时不命中日期过滤。
+                continue
+            if from_bound is not None and recorded < from_bound:
+                continue
+            if to_bound is not None and recorded > to_bound:
+                continue
+        records.append(obj)
+    return {"count": len(records), "records": records}
+
+
 def parse_args(argv):
     audit_path = None
     chained = False
@@ -1061,6 +1154,8 @@ def parse_args(argv):
     check_references = False
     audit_errors = False
     strict_types = False
+    find = False
+    find_filters = {}
     i = 0
     while i < len(argv):
         arg = argv[i]
@@ -1092,10 +1187,28 @@ def parse_args(argv):
         elif arg == "--verify-audit":
             verify = True
             i += 1
+        elif arg == "--audit-find":
+            find = True
+            i += 1
+        elif arg in ("--request-id", "--actor", "--decision", "--from", "--to"):
+            if i + 1 >= len(argv):
+                raise InputError("%s 缺少参数值" % arg)
+            find_filters[arg[2:].replace("-", "_")] = argv[i + 1]
+            i += 2
+        elif any(
+            arg.startswith(name + "=")
+            for name in ("--request-id", "--actor", "--decision", "--from", "--to")
+        ):
+            name, value = arg.split("=", 1)
+            find_filters[name[2:].replace("-", "_")] = value
+            i += 1
         else:
             raise AuditWriteError("未知参数: %s" % arg)
 
     if audit_path is None:
+        if find:
+            # 检索模式缺 --audit-file 归为读取侧错误。
+            raise AuditReadError("缺少必需参数 --audit-file")
         raise AuditWriteError("缺少必需参数 --audit-file")
     if verify and audit_errors:
         # 校验模式只读、不追加，与拒绝审计互斥。
@@ -1103,7 +1216,34 @@ def parse_args(argv):
     if verify and strict_types:
         # 校验模式只读、不读 stdin、不追加，与严格类型校验互斥。
         raise InputError("--verify-audit 不能与 --strict-types 同用")
-    return audit_path, chained, verify, check_references, audit_errors, strict_types
+    if find and verify:
+        # 检索与校验都是只读入口，二者互斥。
+        raise InputError("--audit-find 不能与 --verify-audit 同用")
+    if not find and find_filters:
+        raise InputError(
+            "--request-id/--actor/--decision/--from/--to 须与 --audit-find 同用"
+        )
+    if find:
+        decision = find_filters.get("decision")
+        if decision is not None and decision not in FIND_DECISIONS:
+            raise InputError(
+                "--decision 仅限 %s，实际为 %s"
+                % ("、".join(FIND_DECISIONS), json.dumps(decision, ensure_ascii=False))
+            )
+        # 时间过滤值在参数阶段解析为可比较的 UTC 时刻。
+        for key, label in (("from", "--from"), ("to", "--to")):
+            if key in find_filters:
+                find_filters[key] = _parse_find_bound(find_filters[key], label)
+    return (
+        audit_path,
+        chained,
+        verify,
+        check_references,
+        audit_errors,
+        strict_types,
+        find,
+        find_filters,
+    )
 
 
 def process(
@@ -1194,6 +1334,8 @@ def main(argv):
             check_references,
             audit_errors,
             strict_types,
+            find,
+            find_filters,
         ) = parse_args(argv)
     except GatewayError as exc:
         _emit_error(exc)
@@ -1203,6 +1345,24 @@ def main(argv):
         # 仅校验链式文件，不读取标准输入。
         try:
             result = verify_audit_file(audit_path)
+        except GatewayError as exc:
+            _emit_error(exc)
+            return 2
+        sys.stdout.write(json.dumps(result, ensure_ascii=False) + "\n")
+        sys.stdout.flush()
+        return 0
+
+    if find:
+        # 只读检索：不读取标准输入、不写审计、不做摘要链校验。
+        try:
+            result = find_audit_records(
+                audit_path,
+                request_id=find_filters.get("request_id"),
+                actor=find_filters.get("actor"),
+                decision=find_filters.get("decision"),
+                from_bound=find_filters.get("from"),
+                to_bound=find_filters.get("to"),
+            )
         except GatewayError as exc:
             _emit_error(exc)
             return 2

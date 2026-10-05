@@ -8,6 +8,7 @@
     fhir-gateway --audit-errors --audit-file PATH < request.json
     fhir-gateway --strict-types --audit-file PATH < request.json
     fhir-gateway --require-mappings --audit-file PATH < request.json
+    fhir-gateway --mapping-file PATH --audit-file PATH < request.json
     fhir-gateway --verify-audit --audit-file PATH
     fhir-gateway --audit-find --audit-file PATH [--request-id ID]
                                                  [--actor A]
@@ -55,6 +56,17 @@ status=400、error_type=TermMappingError 的拒绝记录）；transaction 任一
 --require-mappings 均与其互斥，同用返回 InputError。
 --require-mappings 属请求入口开关：与 --verify-audit、--audit-find 同用
 直接返回 InputError（不读 stdin、不写审计）。
+--mapping-file PATH 可选：提供可复用映射目录 JSON 对象，顶层 maps 为数组，
+数组项沿用 system、code、target_system、target_code。文件 maps 与请求
+term_maps 合并后按 system 与 code 精确定位目标；同目标去重，相同源编码出现
+不同目标时以 TermMappingError 结束（错误信息指出源编码与冲突目标，不覆盖）。
+仍先完成请求结构、audit_context、资源、引用与严格类型校验，再校验请求
+term_maps、读取并校验映射文件、合并，随后生成结果并写审计。文件不存在、
+是目录、父目录不存在、无权限、读取失败、内容不是合法 JSON 对象、maps 缺失
+或 maps 不是数组时返回 MappingFileError；条目不是对象或四字段任一缺失/不是
+非空字符串时返回 TermMappingError（定位 maps[i]）。审计不写映射文件路径或
+映射内容，成功 stdout 字段与顺序不变；不传该参数时行为与基线完全一致。
+--mapping-file 与 --verify-audit、--audit-find 互斥，同用返回 InputError。
 """
 
 import datetime
@@ -115,6 +127,10 @@ class FhirValidationError(GatewayError):
 
 class TermMappingError(GatewayError):
     """术语映射项非法，或同一源编码存在多个目标。"""
+
+
+class MappingFileError(GatewayError):
+    """--mapping-file 缺失、不可读或内容结构非法。"""
 
 
 class AuditWriteError(GatewayError):
@@ -647,14 +663,17 @@ def validate_audit_context(audit_context):
             raise InputError("audit_context.%s 必须为非空字符串" % field)
 
 
-def build_term_index(term_maps):
-    """term_maps -> {(system, code): (target_system, target_code)}。"""
+def build_term_index(term_maps, label_prefix="term_maps"):
+    """term_maps -> {(system, code): (target_system, target_code)}。
+
+    label_prefix 为条目定位前缀：请求内为 term_maps，映射文件内为 maps。
+    """
     if not isinstance(term_maps, list):
         raise InputError("term_maps 必须为数组")
 
     index = {}
     for pos, item in enumerate(term_maps):
-        label = "term_maps[%d]" % pos
+        label = "%s[%d]" % (label_prefix, pos)
         if not isinstance(item, dict):
             raise TermMappingError("%s 必须为对象" % label)
         for field in ("system", "code", "target_system", "target_code"):
@@ -665,12 +684,100 @@ def build_term_index(term_maps):
         target = (item["target_system"], item["target_code"])
         if key in index and index[key] != target:
             raise TermMappingError(
-                "同一源编码 %s 存在多个映射目标" % json.dumps(
-                    {"system": key[0], "code": key[1]}, ensure_ascii=False
+                "同一源编码 %s 存在多个映射目标：%s、%s"
+                % (
+                    json.dumps(
+                        {"system": key[0], "code": key[1]}, ensure_ascii=False
+                    ),
+                    json.dumps(
+                        {"system": index[key][0], "code": index[key][1]},
+                        ensure_ascii=False,
+                    ),
+                    json.dumps(
+                        {"system": target[0], "code": target[1]}, ensure_ascii=False
+                    ),
                 )
             )
         index[key] = target
     return index
+
+
+def _mapping_conflict_error(key, existing_target, new_target):
+    """相同源编码指向不同目标：错误信息指出源编码与两个冲突目标，不覆盖。"""
+    return TermMappingError(
+        "同一源编码 %s 存在多个映射目标：%s、%s"
+        % (
+            json.dumps({"system": key[0], "code": key[1]}, ensure_ascii=False),
+            json.dumps(
+                {"system": existing_target[0], "code": existing_target[1]},
+                ensure_ascii=False,
+            ),
+            json.dumps(
+                {"system": new_target[0], "code": new_target[1]}, ensure_ascii=False
+            ),
+        )
+    )
+
+
+def load_mapping_file(path):
+    """读取并校验 --mapping-file，返回其 maps 数组（条目字段留待合并阶段校验）。
+
+    文件层问题——不存在、是目录、父目录不存在、无权限、读取失败、内容不是
+    合法 JSON 对象、maps 缺失或不是数组——统一为 MappingFileError。
+    """
+    if os.path.isdir(path):
+        raise MappingFileError("映射文件路径是目录: %s" % path)
+    parent = os.path.dirname(os.path.abspath(path))
+    if not os.path.isdir(parent):
+        raise MappingFileError("映射文件父目录不存在: %s" % parent)
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read()
+    except FileNotFoundError:
+        raise MappingFileError("映射文件不存在: %s" % path)
+    except OSError as exc:
+        # PermissionError 等无权限/读取失败均归入此类。
+        raise MappingFileError(
+            "读取映射文件失败 %s: %s" % (path, exc.strerror or exc)
+        )
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise MappingFileError("映射文件不是合法 UTF-8: %s: %s" % (path, exc))
+    try:
+        data = json.loads(text)
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise MappingFileError("映射文件内容不是合法 JSON: %s: %s" % (path, exc))
+    if not isinstance(data, dict):
+        raise MappingFileError("映射文件根节点必须为 JSON 对象: %s" % path)
+    if "maps" not in data:
+        raise MappingFileError("映射文件缺少 maps 字段: %s" % path)
+    maps = data["maps"]
+    if not isinstance(maps, list):
+        raise MappingFileError("映射文件 maps 必须为数组: %s" % path)
+    return maps
+
+
+def resolve_term_index(term_maps, mapping_file=None):
+    """构建统一映射索引：先校验请求 term_maps，再加载、校验并合并文件 maps。
+
+    不传 mapping_file 时与 build_term_index(term_maps) 完全等价。传入时：
+    请求侧校验先行（term_maps 非数组仍为 InputError，条目定位仍为
+    term_maps[i]）；随后文件层问题为 MappingFileError，文件条目问题为
+    TermMappingError（定位 maps[i]）；相同目标去重，相同源编码不同目标
+    为 TermMappingError（指出源编码与两个冲突目标），已有目标不被覆盖。
+    """
+    request_index = build_term_index(term_maps)
+    if mapping_file is None:
+        return request_index
+
+    file_maps = load_mapping_file(mapping_file)
+    file_index = build_term_index(file_maps, label_prefix="maps")
+    for key, target in file_index.items():
+        if key in request_index and request_index[key] != target:
+            raise _mapping_conflict_error(key, request_index[key], target)
+        request_index[key] = target
+    return request_index
 
 
 def apply_mappings(resource, index):
@@ -864,12 +971,16 @@ def process_executable_bundle(
     chained=False,
     strict=False,
     require_mappings=False,
+    mapping_file=None,
 ):
     """transaction/batch：按 entry 顺序逐项校验与映射，汇总为响应 Bundle。
 
     --require-mappings 开启时，entry 资源存在未命中映射的编码归入逐项
     mapping/processing：transaction 任一失败整体 400，batch 失败项 400、
     其余继续、整体 200；批量摘要字段与脱敏边界不变。
+    --mapping-file 的文件读取/结构错误（MappingFileError）为网关级错误直接
+    上抛；文件条目非法或两处映射冲突（TermMappingError）与请求 term_maps
+    条目非法一致，降级为逐项 mapping 失败。
     """
     if not _is_nonempty_str(bundle.get("id")):
         raise FhirValidationError("Bundle.id 必须为非空字符串")
@@ -877,9 +988,11 @@ def process_executable_bundle(
     if not isinstance(entries, list):
         raise FhirValidationError("Bundle.entry 必须为数组")
 
-    # term_maps 非数组仍是 InputError；映射项非法/同源冲突降级为逐项 mapping 失败。
+    # term_maps 非数组仍是 InputError 并直接上抛；映射文件层错误
+    # （MappingFileError）同为网关级错误上抛；映射项非法/同源冲突/文件条目
+    # 非法降级为逐项 mapping 失败。
     try:
-        term_index = build_term_index(term_maps)
+        term_index = resolve_term_index(term_maps, mapping_file)
         term_index_error = None
     except TermMappingError as exc:
         term_index = None
@@ -1264,6 +1377,7 @@ def parse_args(argv):
     audit_errors = False
     strict_types = False
     require_mappings = False
+    mapping_file = None
     filters = {
         "request_id": None,
         "actor": None,
@@ -1317,6 +1431,15 @@ def parse_args(argv):
             i += 1
         elif arg == "--require-mappings":
             require_mappings = True
+            i += 1
+        elif arg == "--mapping-file":
+            mapping_file = require_value("--mapping-file", i)
+            require_nonempty("--mapping-file", mapping_file)
+            i += 2
+        elif arg.startswith("--mapping-file="):
+            mapping_file = require_nonempty(
+                "--mapping-file", arg[len("--mapping-file=") :]
+            )
             i += 1
         elif arg == "--verify-audit":
             verify = True
@@ -1421,6 +1544,12 @@ def parse_args(argv):
     if find and require_mappings:
         # 检索不读请求、不执行映射，与映射强校验互斥。
         raise InputError("--audit-find 不能与 --require-mappings 同用")
+    if mapping_file is not None and verify:
+        # 映射目录只属于请求处理入口，与只读离线校验互斥。
+        raise InputError("--verify-audit 不能与 --mapping-file 同用")
+    if mapping_file is not None and find:
+        # 映射目录只属于请求处理入口，与只读检索互斥。
+        raise InputError("--audit-find 不能与 --mapping-file 同用")
     if not find:
         # 过滤参数仅属于 --audit-find，其他入口不接受。
         used = [
@@ -1443,6 +1572,7 @@ def parse_args(argv):
         strict_types,
         require_mappings,
         filters,
+        mapping_file,
     )
 
 
@@ -1453,6 +1583,7 @@ def process(
     check_references=False,
     strict_types=False,
     require_mappings=False,
+    mapping_file=None,
 ):
     try:
         request = json.loads(raw_text)
@@ -1475,6 +1606,8 @@ def process(
     is_bundle = isinstance(resource, dict) and resource.get("resourceType") == "Bundle"
     if is_bundle and resource.get("type") in EXECUTABLE_BUNDLE_TYPES:
         # transaction/batch：批量执行语义，entry 问题进入响应而非网关级错误。
+        # 映射文件读取/结构错误（MappingFileError）仍为网关级错误直接上抛；
+        # 文件条目非法或两处冲突（TermMappingError）沿用逐项 mapping 失败。
         return process_executable_bundle(
             resource,
             term_maps,
@@ -1483,6 +1616,7 @@ def process(
             chained,
             strict=strict_types,
             require_mappings=require_mappings,
+            mapping_file=mapping_file,
         )
     if is_bundle:
         # 顺序：Bundle 自身 → 各 entry.resource（均在 term_maps 校验之前）。
@@ -1495,7 +1629,9 @@ def process(
         validate_resource(resource, strict=strict_types)
         if check_references:
             check_resource_references(resource)
-    index = build_term_index(term_maps)
+    # 请求结构、audit_context、资源、引用与严格类型校验全部通过后，
+    # 再校验请求 term_maps、读取映射文件（--mapping-file）并合并。
+    index = resolve_term_index(term_maps, mapping_file)
     mappings = (
         apply_bundle_mappings(resource, index)
         if is_bundle
@@ -1545,6 +1681,7 @@ def main(argv):
             strict_types,
             require_mappings,
             filters,
+            mapping_file,
         ) = parse_args(argv)
     except GatewayError as exc:
         _emit_error(exc)
@@ -1587,6 +1724,7 @@ def main(argv):
             check_references,
             strict_types,
             require_mappings,
+            mapping_file,
         )
     except GatewayError as exc:
         if audit_errors and _rejection_phase(exc) is not None:

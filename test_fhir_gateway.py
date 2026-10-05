@@ -3864,5 +3864,944 @@ class RequireMappingsTests(unittest.TestCase):
         )
 
 
+def run_mf(payload, audit_file, mapping_file, args=None, raw=None):
+    """带 --mapping-file 的请求处理调用。"""
+    return run(
+        payload,
+        audit_file,
+        args=["--mapping-file", mapping_file] + (args or []),
+        raw=raw,
+    )
+
+
+def write_mapping_file(path, obj=None, *, text=None):
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(text if text is not None else json.dumps(obj))
+
+
+# 可复用映射目录：8867-4 -> 8499000，29463-7 -> 27113001。
+def mapping_catalog():
+    return {
+        "maps": [
+            {
+                "system": "http://loinc.org",
+                "code": "8867-4",
+                "target_system": "http://snomed.info/sct",
+                "target_code": "8499000",
+            },
+            {
+                "system": "http://loinc.org",
+                "code": "29463-7",
+                "target_system": "http://snomed.info/sct",
+                "target_code": "27113001",
+            },
+        ]
+    }
+
+
+class MappingFileTests(unittest.TestCase):
+    def assert_controlled_error(self, proc, error_type):
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(proc.stdout, "")
+        # stderr 恰好一行 JSON。
+        self.assertEqual(proc.stderr.count("\n"), 1)
+        err = json.loads(proc.stderr)["error"]
+        self.assertEqual(err["type"], error_type)
+        self.assertTrue(err["message"])
+        return err["message"]
+
+    def assert_audit_untouched(self, audit_file, expected=None):
+        if expected is None:
+            self.assertFalse(os.path.exists(audit_file))
+        else:
+            with open(audit_file, encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), expected)
+
+    # ---- 不传参数：基线完全不变（抽样）-----------------------------------
+
+    def test_flag_absent_baseline_unchanged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            proc = run(base_request(), audit_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            out = json.loads(proc.stdout)
+            self.assertEqual(
+                list(out.keys()),
+                ["status", "resource_type", "resource", "mappings", "audit"],
+            )
+
+    # ---- 成功：合并、去重、顺序与输出形状 ---------------------------------
+
+    def test_file_only_maps_hit_request_maps_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            mapping_file = os.path.join(tmp, "maps.json")
+            write_mapping_file(mapping_file, mapping_catalog())
+            req = base_request(term_maps=[])
+            proc = run_mf(req, audit_file, mapping_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stderr, "")
+            out = json.loads(proc.stdout)
+            self.assertEqual(
+                list(out.keys()),
+                ["status", "resource_type", "resource", "mappings", "audit"],
+            )
+            self.assertEqual(out["resource"], req["resource"])
+            self.assertEqual(len(out["mappings"]), 1)
+            mapping = out["mappings"][0]
+            self.assertEqual(mapping["status"], "mapped")
+            self.assertEqual(
+                mapping["target"],
+                {"system": "http://snomed.info/sct", "code": "8499000"},
+            )
+            self.assertEqual(len(read_audit_lines(audit_file)), 1)
+
+    def test_file_and_request_merge_distinct_sources(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            mapping_file = os.path.join(tmp, "maps.json")
+            write_mapping_file(mapping_file, mapping_catalog())
+            req = base_request(
+                resource={
+                    "resourceType": "Observation",
+                    "id": "o1",
+                    "status": "final",
+                    "code": {
+                        "coding": [
+                            {"system": "http://loinc.org", "code": "8867-4"},
+                            {"system": "http://loinc.org", "code": "29463-7"},
+                            {"system": "http://rxnorm", "code": "313760"},
+                        ]
+                    },
+                },
+                term_maps=[
+                    {
+                        "system": "http://rxnorm",
+                        "code": "313760",
+                        "target_system": "http://snomed.info/sct",
+                        "target_code": "1111111",
+                    }
+                ],
+            )
+            proc = run_mf(req, audit_file, mapping_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(
+                [(m["source"]["code"], m["status"], m["target"]["code"])
+                 for m in json.loads(proc.stdout)["mappings"]],
+                [
+                    ("8867-4", "mapped", "8499000"),
+                    ("29463-7", "mapped", "27113001"),
+                    ("313760", "mapped", "1111111"),
+                ],
+            )
+
+    def test_same_source_same_target_dedup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            mapping_file = os.path.join(tmp, "maps.json")
+            write_mapping_file(mapping_file, mapping_catalog())
+            # 请求与文件对同一源编码给出完全相同的目标：去重后成功。
+            req = base_request(
+                term_maps=[
+                    {
+                        "system": "http://loinc.org",
+                        "code": "8867-4",
+                        "target_system": "http://snomed.info/sct",
+                        "target_code": "8499000",
+                    }
+                ]
+            )
+            proc = run_mf(req, audit_file, mapping_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(
+                json.loads(proc.stdout)["mappings"][0]["target"]["code"],
+                "8499000",
+            )
+
+    def test_duplicate_same_target_within_file_allowed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            mapping_file = os.path.join(tmp, "maps.json")
+            catalog = mapping_catalog()
+            catalog["maps"].append(dict(catalog["maps"][0]))
+            write_mapping_file(mapping_file, catalog)
+            proc = run_mf(base_request(term_maps=[]), audit_file, mapping_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_unmapped_remains_unmapped_target_null(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            mapping_file = os.path.join(tmp, "maps.json")
+            write_mapping_file(mapping_file, mapping_catalog())
+            req = base_request(
+                resource={
+                    "resourceType": "Observation",
+                    "id": "o1",
+                    "status": "final",
+                    "code": {
+                        "coding": [
+                            {"system": "http://loinc.org", "code": "8867-4"},
+                            {"system": "http://other", "code": "nope"},
+                        ]
+                    },
+                },
+                term_maps=[],
+            )
+            proc = run_mf(req, audit_file, mapping_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            mappings = json.loads(proc.stdout)["mappings"]
+            self.assertEqual(mappings[0]["status"], "mapped")
+            self.assertEqual(mappings[1]["status"], "unmapped")
+            self.assertIsNone(mappings[1]["target"])
+
+    def test_non_executable_bundle_merge_in_entry_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            mapping_file = os.path.join(tmp, "maps.json")
+            write_mapping_file(mapping_file, mapping_catalog())
+            entries = [
+                observation_entry("obs-1", code="8867-4"),
+                observation_entry("obs-2", code="29463-7"),
+                patient_entry("pat-1"),
+                observation_entry("obs-3", code="8867-4"),
+            ]
+            req = bundle_request(entries, term_maps=[])
+            proc = run_mf(req, audit_file, mapping_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            out = json.loads(proc.stdout)
+            self.assertEqual(out["resource_type"], "Bundle")
+            self.assertEqual(out["resource"], req["resource"])
+            self.assertEqual(
+                [(m["source"]["code"], m["status"]) for m in out["mappings"]],
+                [("8867-4", "mapped"), ("29463-7", "mapped"),
+                 ("8867-4", "mapped")],
+            )
+            self.assertEqual(len(read_audit_lines(audit_file)), 1)
+
+    def test_audit_excludes_path_and_mapping_content(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            mapping_file = os.path.join(tmp, "secret-dir-name_maps.json")
+            write_mapping_file(mapping_file, mapping_catalog())
+            proc = run_mf(base_request(term_maps=[]), audit_file, mapping_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            with open(audit_file, "rb") as fh:
+                raw = fh.read().decode("utf-8")
+            self.assertNotIn("secret-dir-name_maps.json", raw)
+            self.assertNotIn("8499000", raw)
+            self.assertNotIn("snomed", raw)
+            self.assertNotIn("target_system", raw)
+            (record,) = read_audit_lines(audit_file)
+            self.assertEqual(
+                set(record),
+                {"request_id", "actor", "recorded_at", "decision", "audit_id"},
+            )
+
+    # ---- 冲突：相同源编码不同目标 ----------------------------------------
+
+    def test_file_request_conflicting_targets_is_term_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            mapping_file = os.path.join(tmp, "maps.json")
+            write_mapping_file(mapping_file, mapping_catalog())
+            req = base_request(
+                term_maps=[
+                    {
+                        "system": "http://loinc.org",
+                        "code": "8867-4",
+                        "target_system": "http://other.example",
+                        "target_code": "zzz",
+                    }
+                ]
+            )
+            proc = run_mf(req, audit_file, mapping_file)
+            message = self.assert_controlled_error(proc, "TermMappingError")
+            # 信息指出源编码与两个冲突目标。
+            self.assertIn("8867-4", message)
+            self.assertIn("zzz", message)
+            self.assertIn("8499000", message)
+            self.assertIn("多个映射目标", message)
+            self.assert_audit_untouched(audit_file)
+
+    def test_conflict_within_file_is_term_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            mapping_file = os.path.join(tmp, "maps.json")
+            write_mapping_file(
+                mapping_file,
+                {
+                    "maps": [
+                        {
+                            "system": "http://loinc.org",
+                            "code": "8867-4",
+                            "target_system": "http://a.example",
+                            "target_code": "AAA",
+                        },
+                        {
+                            "system": "http://loinc.org",
+                            "code": "8867-4",
+                            "target_system": "http://b.example",
+                            "target_code": "BBB",
+                        },
+                    ]
+                },
+            )
+            proc = run_mf(base_request(term_maps=[]), audit_file, mapping_file)
+            message = self.assert_controlled_error(proc, "TermMappingError")
+            self.assertIn("8867-4", message)
+            self.assertIn("AAA", message)
+            self.assertIn("BBB", message)
+            self.assert_audit_untouched(audit_file)
+
+    def test_conflict_does_not_overwrite_and_preserves_existing_audit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            sentinel = '{"decision": "accepted", "audit_id": "kept"}\n'
+            with open(audit_file, "w", encoding="utf-8") as fh:
+                fh.write(sentinel)
+            mapping_file = os.path.join(tmp, "maps.json")
+            write_mapping_file(mapping_file, mapping_catalog())
+            req = base_request(
+                term_maps=[
+                    {
+                        "system": "http://loinc.org",
+                        "code": "8867-4",
+                        "target_system": "http://other.example",
+                        "target_code": "zzz",
+                    }
+                ]
+            )
+            proc = run_mf(req, audit_file, mapping_file)
+            self.assert_controlled_error(proc, "TermMappingError")
+            self.assert_audit_untouched(audit_file, sentinel)
+
+    # ---- MappingFileError：文件层错误 -------------------------------------
+
+    def test_mapping_file_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            proc = run_mf(
+                base_request(), audit_file, os.path.join(tmp, "missing.json")
+            )
+            self.assert_controlled_error(proc, "MappingFileError")
+            self.assert_audit_untouched(audit_file)
+
+    def test_mapping_file_is_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            proc = run_mf(base_request(), audit_file, tmp)
+            self.assert_controlled_error(proc, "MappingFileError")
+            self.assert_audit_untouched(audit_file)
+
+    def test_mapping_file_parent_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            target = os.path.join(tmp, "nodir", "maps.json")
+            proc = run_mf(base_request(), audit_file, target)
+            self.assert_controlled_error(proc, "MappingFileError")
+            self.assert_audit_untouched(audit_file)
+
+    @unittest.skipIf(
+        os.geteuid() == 0, "root 绕过文件权限位，无法稳定触发 EACCES"
+    )
+    def test_mapping_file_no_permission(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            mapping_file = os.path.join(tmp, "maps.json")
+            write_mapping_file(mapping_file, mapping_catalog())
+            os.chmod(mapping_file, 0o000)
+            try:
+                proc = run_mf(base_request(), audit_file, mapping_file)
+            finally:
+                os.chmod(mapping_file, 0o644)
+            self.assert_controlled_error(proc, "MappingFileError")
+            self.assert_audit_untouched(audit_file)
+
+    def test_mapping_file_invalid_json(self):
+        cases = ["{not json", "", "\x00\x01"]
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            for pos, text in enumerate(cases):
+                mapping_file = os.path.join(tmp, "maps%d.json" % pos)
+                write_mapping_file(mapping_file, text=text)
+                proc = run_mf(base_request(), audit_file, mapping_file)
+                self.assert_controlled_error(proc, "MappingFileError")
+            self.assert_audit_untouched(audit_file)
+
+    def test_mapping_file_root_not_object(self):
+        cases = ["[1, 2]", "5", "null", '"str"', "true"]
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            for pos, text in enumerate(cases):
+                mapping_file = os.path.join(tmp, "maps%d.json" % pos)
+                write_mapping_file(mapping_file, text=text)
+                proc = run_mf(base_request(), audit_file, mapping_file)
+                self.assert_controlled_error(proc, "MappingFileError")
+            self.assert_audit_untouched(audit_file)
+
+    def test_mapping_file_maps_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            mapping_file = os.path.join(tmp, "maps.json")
+            write_mapping_file(mapping_file, {"other": []})
+            proc = run_mf(base_request(), audit_file, mapping_file)
+            self.assert_controlled_error(proc, "MappingFileError")
+            self.assert_audit_untouched(audit_file)
+
+    def test_mapping_file_maps_not_array(self):
+        cases = [{"maps": {}}, {"maps": "x"}, {"maps": 1}, {"maps": None}]
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            for pos, obj in enumerate(cases):
+                mapping_file = os.path.join(tmp, "maps%d.json" % pos)
+                write_mapping_file(mapping_file, obj)
+                proc = run_mf(base_request(), audit_file, mapping_file)
+                self.assert_controlled_error(proc, "MappingFileError")
+            self.assert_audit_untouched(audit_file)
+
+    def test_mapping_file_error_preserves_existing_audit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            sentinel = '{"decision": "accepted", "audit_id": "kept"}\n'
+            with open(audit_file, "w", encoding="utf-8") as fh:
+                fh.write(sentinel)
+            mapping_file = os.path.join(tmp, "maps.json")
+            write_mapping_file(mapping_file, {"maps": "nope"})
+            proc = run_mf(base_request(), audit_file, mapping_file)
+            self.assert_controlled_error(proc, "MappingFileError")
+            self.assert_audit_untouched(audit_file, sentinel)
+
+    # ---- TermMappingError：文件条目字段错误 ------------------------------
+
+    def test_mapping_entry_not_object(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            mapping_file = os.path.join(tmp, "maps.json")
+            write_mapping_file(mapping_file, {"maps": [5]})
+            proc = run_mf(base_request(), audit_file, mapping_file)
+            message = self.assert_controlled_error(proc, "TermMappingError")
+            self.assertIn("maps[0]", message)
+            self.assert_audit_untouched(audit_file)
+
+    def test_mapping_entry_missing_fields(self):
+        base = {
+            "system": "s",
+            "code": "c",
+            "target_system": "ts",
+            "target_code": "tc",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            for field in ("system", "code", "target_system", "target_code"):
+                item = dict(base)
+                del item[field]
+                mapping_file = os.path.join(tmp, "maps-%s.json" % field)
+                write_mapping_file(mapping_file, {"maps": [item]})
+                proc = run_mf(base_request(), audit_file, mapping_file)
+                message = self.assert_controlled_error(proc, "TermMappingError")
+                self.assertIn("maps[0].%s" % field, message)
+            self.assert_audit_untouched(audit_file)
+
+    def test_mapping_entry_invalid_field_types(self):
+        bad_values = ("", 123, True, None, [], {})
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            for pos, bad in enumerate(bad_values):
+                item = {
+                    "system": "s",
+                    "code": "c",
+                    "target_system": "ts",
+                    "target_code": bad,
+                }
+                mapping_file = os.path.join(tmp, "maps%d.json" % pos)
+                write_mapping_file(mapping_file, {"maps": [item]})
+                proc = run_mf(base_request(), audit_file, mapping_file)
+                message = self.assert_controlled_error(proc, "TermMappingError")
+                self.assertIn("maps[0].target_code", message)
+            self.assert_audit_untouched(audit_file)
+
+    def test_file_entry_error_uses_maps_label_not_term_maps(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            mapping_file = os.path.join(tmp, "maps.json")
+            write_mapping_file(mapping_file, {"maps": [{"system": "s"}]})
+            proc = run_mf(base_request(), audit_file, mapping_file)
+            message = self.assert_controlled_error(proc, "TermMappingError")
+            self.assertIn("maps[0]", message)
+            self.assertNotIn("term_maps", message)
+            self.assert_audit_untouched(audit_file)
+
+    # ---- 参数与入口互斥 ---------------------------------------------------
+
+    def test_mutex_with_verify_audit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            mapping_file = os.path.join(tmp, "maps.json")
+            write_mapping_file(mapping_file, mapping_catalog())
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    GATEWAY,
+                    "--mapping-file",
+                    mapping_file,
+                    "--verify-audit",
+                    "--audit-file",
+                    audit_file,
+                ],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(result.stdout, "")
+            self.assertEqual(
+                json.loads(result.stderr)["error"]["type"], "InputError"
+            )
+            self.assertFalse(os.path.exists(audit_file))
+
+    def test_mutex_with_audit_find(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            mapping_file = os.path.join(tmp, "maps.json")
+            write_mapping_file(mapping_file, mapping_catalog())
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    GATEWAY,
+                    "--mapping-file",
+                    mapping_file,
+                    "--audit-find",
+                    "--audit-file",
+                    audit_file,
+                ],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertEqual(result.stdout, "")
+            self.assertEqual(
+                json.loads(result.stderr)["error"]["type"], "InputError"
+            )
+            self.assertFalse(os.path.exists(audit_file))
+
+    def test_mapping_file_empty_or_missing_value_is_input_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            proc_empty = run(
+                base_request(), audit_file, args=["--mapping-file="]
+            )
+            self.assert_controlled_error(proc_empty, "InputError")
+            proc_missing = run(
+                base_request(), audit_file, args=["--mapping-file"]
+            )
+            self.assert_controlled_error(proc_missing, "InputError")
+            self.assert_audit_untouched(audit_file)
+
+    def test_missing_audit_file_is_write_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mapping_file = os.path.join(tmp, "maps.json")
+            write_mapping_file(mapping_file, mapping_catalog())
+            proc = run(
+                base_request(), None, args=["--mapping-file", mapping_file]
+            )
+            self.assert_controlled_error(proc, "AuditWriteError")
+
+    # ---- 错误优先级：请求/资源先于映射文件 -------------------------------
+
+    def test_bad_request_json_precedes_missing_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            proc = run_mf(
+                None,
+                audit_file,
+                os.path.join(tmp, "nope.json"),
+                raw="{not json",
+            )
+            self.assert_controlled_error(proc, "InputError")
+            self.assert_audit_untouched(audit_file)
+
+    def test_bad_audit_context_precedes_missing_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            req = base_request()
+            req["audit_context"] = {"request_id": "", "actor": "a", "recorded_at": "t"}
+            proc = run_mf(req, audit_file, os.path.join(tmp, "nope.json"))
+            self.assert_controlled_error(proc, "InputError")
+            self.assert_audit_untouched(audit_file)
+
+    def test_resource_validation_precedes_missing_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            req = base_request()
+            req["resource"]["status"] = "draft"
+            proc = run_mf(req, audit_file, os.path.join(tmp, "nope.json"))
+            self.assert_controlled_error(proc, "FhirValidationError")
+            self.assert_audit_untouched(audit_file)
+
+    def test_reference_check_precedes_missing_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            resource = {
+                "resourceType": "Patient",
+                "id": "pat-1",
+                "managingOrganization": {"reference": "#ghost"},
+            }
+            req = base_request(resource=resource)
+            proc = run_mf(
+                req,
+                audit_file,
+                os.path.join(tmp, "nope.json"),
+                args=["--check-references"],
+            )
+            self.assert_controlled_error(proc, "FhirValidationError")
+            self.assert_audit_untouched(audit_file)
+
+    def test_strict_types_precedes_missing_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            req = base_request(
+                resource={
+                    "resourceType": "Observation",
+                    "id": "o1",
+                    "status": "final",
+                    "code": {
+                        "coding": [
+                            {"system": "http://loinc.org", "code": "8867-4"}
+                        ]
+                    },
+                    "valueInteger": "5",
+                }
+            )
+            proc = run_mf(
+                req,
+                audit_file,
+                os.path.join(tmp, "nope.json"),
+                args=["--strict-types"],
+            )
+            self.assert_controlled_error(proc, "FhirValidationError")
+            self.assert_audit_untouched(audit_file)
+
+    def test_term_maps_not_array_precedes_missing_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            req = base_request(
+                resource=patient_resource(), term_maps={}
+            )
+            proc = run_mf(req, audit_file, os.path.join(tmp, "nope.json"))
+            self.assert_controlled_error(proc, "InputError")
+            self.assert_audit_untouched(audit_file)
+
+    def test_request_term_map_entry_error_precedes_file_load(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            req = base_request(
+                resource=patient_resource(), term_maps=[{"system": "s"}]
+            )
+            # 映射文件同时缺失：请求侧 term_maps 条目错误必须先报。
+            proc = run_mf(req, audit_file, os.path.join(tmp, "nope.json"))
+            message = self.assert_controlled_error(proc, "TermMappingError")
+            self.assertIn("term_maps[0]", message)
+            self.assert_audit_untouched(audit_file)
+
+    # ---- 与其他开关组合 ---------------------------------------------------
+
+    def test_chain_success_and_verify(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            mapping_file = os.path.join(tmp, "maps.json")
+            write_mapping_file(mapping_file, mapping_catalog())
+            proc = run_mf(
+                base_request(term_maps=[]),
+                audit_file,
+                mapping_file,
+                args=["--audit-chain"],
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            result = run_verify(audit_file)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout)["line_count"], 1)
+
+    def test_audit_errors_term_conflict_writes_mapping_rejection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            mapping_file = os.path.join(tmp, "maps.json")
+            write_mapping_file(mapping_file, mapping_catalog())
+            req = base_request(
+                term_maps=[
+                    {
+                        "system": "http://loinc.org",
+                        "code": "8867-4",
+                        "target_system": "http://other.example",
+                        "target_code": "zzz",
+                    }
+                ]
+            )
+            proc = run_mf(req, audit_file, mapping_file, args=["--audit-errors"])
+            self.assert_controlled_error(proc, "TermMappingError")
+            (record,) = read_audit_lines(audit_file)
+            self.assertEqual(record["decision"], "rejected")
+            self.assertEqual(record["phase"], "mapping")
+            self.assertEqual(record["status"], 400)
+            self.assertEqual(record["error_type"], "TermMappingError")
+            with open(audit_file, "rb") as fh:
+                raw = fh.read().decode("utf-8")
+            self.assertNotIn("maps.json", raw)
+            self.assertNotIn("8499000", raw)
+
+    def test_audit_errors_file_entry_error_writes_mapping_rejection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            mapping_file = os.path.join(tmp, "maps.json")
+            write_mapping_file(mapping_file, {"maps": [{"system": "s"}]})
+            proc = run_mf(
+                base_request(), audit_file, mapping_file, args=["--audit-errors"]
+            )
+            self.assert_controlled_error(proc, "TermMappingError")
+            (record,) = read_audit_lines(audit_file)
+            self.assertEqual(record["phase"], "mapping")
+            self.assertEqual(record["error_type"], "TermMappingError")
+
+    def test_audit_errors_mapping_file_error_writes_no_rejection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            proc = run_mf(
+                base_request(),
+                audit_file,
+                os.path.join(tmp, "nope.json"),
+                args=["--audit-errors"],
+            )
+            self.assert_controlled_error(proc, "MappingFileError")
+            self.assert_audit_untouched(audit_file)
+
+    def test_require_mappings_with_file_all_hit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            mapping_file = os.path.join(tmp, "maps.json")
+            write_mapping_file(mapping_file, mapping_catalog())
+            req = base_request(term_maps=[])
+            proc = run_mf(req, audit_file, mapping_file, args=["--require-mappings"])
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            out = json.loads(proc.stdout)
+            self.assertTrue(all(m["status"] == "mapped" for m in out["mappings"]))
+
+    def test_require_mappings_with_file_miss_is_term_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            mapping_file = os.path.join(tmp, "maps.json")
+            write_mapping_file(mapping_file, mapping_catalog())
+            req = base_request(
+                resource={
+                    "resourceType": "Observation",
+                    "id": "o1",
+                    "status": "final",
+                    "code": {
+                        "coding": [
+                            {"system": "http://loinc.org", "code": "8867-4"},
+                            {"system": "http://loinc.org", "code": "29463-7"},
+                            {"system": "http://z", "code": "q"},
+                        ]
+                    },
+                },
+                term_maps=[],
+            )
+            proc = run_mf(req, audit_file, mapping_file, args=["--require-mappings"])
+            message = self.assert_controlled_error(proc, "TermMappingError")
+            self.assertIn("q", message)
+            self.assert_audit_untouched(audit_file)
+
+    def test_check_references_with_file_success(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            mapping_file = os.path.join(tmp, "maps.json")
+            write_mapping_file(mapping_file, mapping_catalog())
+            proc = run_mf(
+                base_request(term_maps=[]),
+                audit_file,
+                mapping_file,
+                args=["--check-references"],
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_strict_types_with_file_success(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            mapping_file = os.path.join(tmp, "maps.json")
+            write_mapping_file(mapping_file, mapping_catalog())
+            proc = run_mf(
+                base_request(term_maps=[]),
+                audit_file,
+                mapping_file,
+                args=["--strict-types"],
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    # ---- transaction / batch ---------------------------------------------
+
+    def test_executable_bundle_uses_file_mappings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            mapping_file = os.path.join(tmp, "maps.json")
+            write_mapping_file(mapping_file, mapping_catalog())
+            entries = [
+                tx_entry(patient_resource("pat-1")),
+                tx_entry(observation_resource("obs-1")),
+            ]
+            req = executable_request(entries, term_maps=[])
+            proc = run_mf(
+                req,
+                audit_file,
+                mapping_file,
+                args=["--require-mappings"],
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            out = json.loads(proc.stdout)
+            self.assertEqual(out["status"], 200)
+            self.assertEqual(
+                [e["status"] for e in out["resource"]["entry"]], [200, 200]
+            )
+            # 可执行 Bundle 输出无 mappings 字段，成功 stdout 字段顺序不变。
+            self.assertEqual(
+                list(out.keys()), ["status", "resource_type", "resource", "audit"]
+            )
+
+    def test_batch_file_only_without_require_leaves_unmapped_as_200(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            mapping_file = os.path.join(tmp, "maps.json")
+            # 目录只有 8867-4；不加 --require-mappings 时未命中不逐项失败。
+            write_mapping_file(mapping_file, {"maps": [mapping_catalog()["maps"][0]]})
+            entries = [tx_entry(observation_resource("obs-1"))]
+            req = executable_request(entries, bundle_type="batch", term_maps=[])
+            proc = run_mf(req, audit_file, mapping_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            out = json.loads(proc.stdout)
+            self.assertEqual(out["status"], 200)
+            self.assertEqual(out["resource"]["entry"][0]["status"], 200)
+
+    def test_batch_require_mappings_file_miss_per_entry_400(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            mapping_file = os.path.join(tmp, "maps.json")
+            write_mapping_file(mapping_file, {"maps": []})
+            entries = [
+                tx_entry(patient_resource("pat-1")),
+                tx_entry(observation_resource("obs-1")),
+            ]
+            req = executable_request(entries, bundle_type="batch", term_maps=[])
+            proc = run_mf(
+                req, audit_file, mapping_file, args=["--require-mappings"]
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            out = json.loads(proc.stdout)
+            self.assertEqual(out["status"], 200)
+            self.assertEqual(
+                [e["status"] for e in out["resource"]["entry"]], [200, 400]
+            )
+            issue = out["resource"]["entry"][1]["outcome"]["issue"][0]
+            self.assertEqual(issue["code"], "processing")
+            self.assertEqual(issue["entry"], 1)
+            self.assertEqual(
+                [(a["index"], a["phase"], a["status"], a["issue_code"])
+                 for a in out["audit"]["entries"]],
+                [(0, "completed", 200, None),
+                 (1, "mapping", 400, "processing")],
+            )
+
+    def test_executable_bundle_mapping_file_error_is_gateway_error(self):
+        for bundle_type in ("transaction", "batch"):
+            with tempfile.TemporaryDirectory() as tmp:
+                audit_file = os.path.join(tmp, "audit-%s.jsonl" % bundle_type)
+                entries = [tx_entry(observation_resource("obs-1"))]
+                req = executable_request(entries, bundle_type=bundle_type, term_maps=[])
+                proc = run_mf(
+                    req, audit_file, os.path.join(tmp, "nope.json")
+                )
+                self.assert_controlled_error(proc, "MappingFileError")
+                self.assert_audit_untouched(audit_file)
+
+    def test_executable_bundle_file_entry_error_degrades_per_entry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            mapping_file = os.path.join(tmp, "maps.json")
+            write_mapping_file(mapping_file, {"maps": [{"system": "s"}]})
+            entries = [
+                tx_entry(patient_resource("pat-1")),
+                tx_entry(observation_resource("obs-1")),
+            ]
+            req = executable_request(entries, bundle_type="batch", term_maps=[])
+            proc = run_mf(req, audit_file, mapping_file)
+            # 逐项失败不升级为网关错误：退出码 0，审计照常写一条摘要。
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            out = json.loads(proc.stdout)
+            self.assertEqual(out["status"], 200)
+            self.assertEqual(
+                [e["status"] for e in out["resource"]["entry"]], [400, 400]
+            )
+            for pos, entry in enumerate(out["resource"]["entry"]):
+                issue = entry["outcome"]["issue"][0]
+                self.assertEqual(issue["code"], "processing")
+                self.assertIn("maps[0]", issue["diagnostics"])
+            self.assertEqual(
+                [a["phase"] for a in out["audit"]["entries"]],
+                ["mapping", "mapping"],
+            )
+            self.assertEqual(len(read_audit_lines(audit_file)), 1)
+
+    def test_executable_bundle_conflict_degrades_per_entry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            mapping_file = os.path.join(tmp, "maps.json")
+            write_mapping_file(mapping_file, mapping_catalog())
+            entries = [tx_entry(observation_resource("obs-1"))]
+            req = executable_request(
+                entries,
+                bundle_type="transaction",
+                term_maps=[
+                    {
+                        "system": "http://loinc.org",
+                        "code": "8867-4",
+                        "target_system": "http://other.example",
+                        "target_code": "zzz",
+                    }
+                ],
+            )
+            proc = run_mf(req, audit_file, mapping_file)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            out = json.loads(proc.stdout)
+            self.assertEqual(out["status"], 400)
+            entry = out["resource"]["entry"][0]
+            self.assertEqual(entry["status"], 400)
+            issue = entry["outcome"]["issue"][0]
+            self.assertEqual(issue["code"], "processing")
+            self.assertIn("多个映射目标", issue["diagnostics"])
+            self.assertIn("8499000", issue["diagnostics"])
+            self.assertIn("zzz", issue["diagnostics"])
+            self.assertEqual(out["audit"]["entries"][0]["phase"], "mapping")
+
+    def test_executable_bundle_summary_excludes_path_and_mappings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            audit_file = os.path.join(tmp, "audit.jsonl")
+            mapping_file = os.path.join(tmp, "catalog_maps.json")
+            write_mapping_file(mapping_file, mapping_catalog())
+            entries = [
+                tx_entry(patient_resource("pat-1")),
+                tx_entry(observation_resource("obs-1")),
+            ]
+            req = executable_request(entries, term_maps=[])
+            proc = run_mf(
+                req,
+                audit_file,
+                mapping_file,
+                args=["--require-mappings"],
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            with open(audit_file, "rb") as fh:
+                raw = fh.read().decode("utf-8")
+            self.assertNotIn("catalog_maps", raw)
+            self.assertNotIn("8499000", raw)
+            self.assertNotIn("snomed", raw)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

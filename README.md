@@ -20,6 +20,7 @@ fhir-gateway --check-references --audit-file PATH [--mapping-file PATH] < reques
 fhir-gateway --audit-errors --audit-file PATH [--mapping-file PATH] < request.json
 fhir-gateway --strict-types --audit-file PATH [--mapping-file PATH] < request.json
 fhir-gateway --require-mappings --audit-file PATH [--mapping-file PATH] < request.json
+fhir-gateway --apply-mappings --audit-file PATH [--mapping-file PATH] < request.json
 fhir-gateway --verify-audit --audit-file PATH
 fhir-gateway --audit-find --audit-file PATH [--request-id ID] [--actor A] \
   [--decision accepted|rejected] [--from YYYY-MM-DDTHH:MM:SSZ] [--to YYYY-MM-DDTHH:MM:SSZ]
@@ -32,6 +33,7 @@ fhir-gateway --audit-find --audit-file PATH [--request-id ID] [--actor A] \
 - `--audit-errors`（可选）：请求处理失败时追加一条 `decision=rejected` 的拒绝审计记录；不开启时行为完全不变。
 - `--strict-types`（可选）：对 Patient/Observation/Condition 的已知字段收紧为 FHIR R4 类型；不开启时解析、校验、映射、输出与审计行为完全不变。
 - `--require-mappings`（可选）：要求资源内每个源编码都在 `term_maps` 中精确命中目标；只影响请求入口，不开启时解析、校验、映射、输出与审计行为完全不变。
+- `--apply-mappings`（可选）：把映射结果落回资源，stdout 的 `resource` 为改写后的版本；不开启时解析、校验、resource 原样返回、mappings 输出、stdout 顺序、审计与错误行为完全不变。
 - `--verify-audit`（可选）：只校验链式文件，不读取标准输入。
 - `--audit-find`（可选）：只读检索审计 JSON Lines，不读取标准输入、不写审计、不执行校验/映射等其他功能。
 - 请求 JSON 从标准输入读取（校验模式与检索模式除外）。
@@ -181,6 +183,19 @@ transaction / batch Bundle（批量执行语义，每个 entry 带 `request`）�
 - 缺 `--audit-file`、审计文件不可写或链式文件非法仍返回 `AuditWriteError`：stdout 为空、退出码 `2`、不写业务审计。
 - `--verify-audit`、`--audit-find` 不读取请求，与 `--require-mappings` 同用直接返回 `InputError`（不读 stdin、不写审计、不创建文件）。
 
+## 映射结果落回（--apply-mappings）
+
+`--apply-mappings` 为可选开关：把映射结果落回资源，stdout 的 `resource` 输出改写后的版本。**不开启时，解析、校验、resource 原样返回、mappings 输出、stdout 顺序、审计与既有错误行为完全不变。**
+
+开启后仅接受单资源与 entry 只含 `resource` 的非 transaction、非 batch Bundle；`type` 为 `transaction`/`batch` 的 Bundle 返回 `InputError`（stdout 为空、stderr 一行 JSON、退出码 `2`，不写审计）。请求仍沿用既有校验顺序与映射冲突规则（请求结构、`audit_context`、资源、引用、严格类型、`term_maps` 索引与合并、同源冲突的优先级均不变）。
+
+- 对当前映射实际扫描的每个 coding（含非空 `system` + `code` 的对象），映射结果为 `mapped` 时把 `system`、`code` 就地改写为 `target_system`/`target_code`，其余键值（如 `display`、`userSelected`）保留；重复出现的源编码逐个改写，`unmapped` 的 coding 与资源的其余内容不变。
+- 非 transaction/batch Bundle 的每个 `entry.resource` 同样处理；Bundle 的 `id`、`type`、`entry` 顺序及 `request` 等字段不变，空 entry 或无 `resource` 的 entry 不变。
+- 成功输出仍是 `status`、`resource_type`、`resource`、`mappings`、`audit`：`resource` 为落回版本，`mappings` 的顺序及 `source`、`status`、`target` 与不开启时完全一致（`source` 仍记录原始编码，不从 mappings 消失）；同一源编码存在不同目标仍报 `TermMappingError`。
+- 可与 `--mapping-file`、`--strict-types`、`--check-references`、`--require-mappings`、`--audit-chain`、`--audit-errors` 组合，语义各自不变；与 `--verify-audit` 或 `--audit-find` 同用返回 `InputError`（不读 stdin、不写审计）。
+- 除模式冲突与可执行 Bundle 使用开关（均为 `InputError`）外不新增错误类型；失败仍为空 stdout、单行 JSON stderr、退出码 `2`，原错误边界与 `--audit-errors` 规则不变。
+- 审计仍先于 stdout 落盘，字段与脱敏边界不变：不记录资源正文、映射目标或 mapping-file 路径；链摘要、`audit_id`、`--verify-audit` 与 `--audit-find` 只读检索保持兼容。
+
 ## 可复用映射目录（--mapping-file）
 
 `--mapping-file PATH` 为可选参数：把常用映射放在请求之外的文件里，避免每个请求重复携带相同 `term_maps`。**不传该参数时，解析、校验、映射、stdout、审计与错误行为与基线完全一致。**
@@ -255,7 +270,7 @@ transaction/batch 中的边界：
 ```
 
 - 资源内所有含非空 `system`/`code` 的编码对象（含嵌套结构）逐项生成映射结果；命中给目标，未命中 `status=unmapped` 且 `target=null`。Bundle 按 `entry` 顺序、每个资源按嵌套顺序收集，重复编码逐项列出、不合并。
-- `resource` 原样返回，绝不改写；Bundle 成功时 `resource_type` 为 `Bundle`。
+- `resource` 原样返回，绝不改写（开启 `--apply-mappings` 时为落回后的版本，详见“映射结果落回（--apply-mappings）”一节）；Bundle 成功时 `resource_type` 为 `Bundle`。
 - 审计行（不含 `resource`、`mappings`）随后追加到 `--audit-file`，一行一条 JSON；每个 Bundle 仅追加一条审计。
 
 ## transaction / batch 批量执行
@@ -455,7 +470,7 @@ fhir-gateway --audit-find --audit-file PATH [过滤项...]
 
 | 错误类型 | 触发场景 |
 | --- | --- |
-| `InputError` | 标准输入不是合法 JSON、请求结构非法、缺少字段、`audit_context` 非法；`--audit-find` 时过滤值非法（`--decision` 取值越界、过滤值为空）、`--from`/`--to` 时间格式非法、过滤项脱离 `--audit-find` 使用、或 `--audit-find` 与 `--verify-audit` 同用；`--require-mappings` 与 `--verify-audit` 或 `--audit-find` 同用；`--mapping-file` 与 `--verify-audit` 或 `--audit-find` 同用 |
+| `InputError` | 标准输入不是合法 JSON、请求结构非法、缺少字段、`audit_context` 非法；`--audit-find` 时过滤值非法（`--decision` 取值越界、过滤值为空）、`--from`/`--to` 时间格式非法、过滤项脱离 `--audit-find` 使用、或 `--audit-find` 与 `--verify-audit` 同用；`--require-mappings` 与 `--verify-audit` 或 `--audit-find` 同用；`--mapping-file` 与 `--verify-audit` 或 `--audit-find` 同用；`--apply-mappings` 与 `--verify-audit` 或 `--audit-find` 同用，或 `--apply-mappings` 用于 transaction/batch Bundle |
 | `FhirValidationError` | 资源类型/id/status/编码不满足校验规则；开启 `--strict-types` 时已知字段为 `null`、形状错误、数字代字符串、日期非法或出现多个 `value[x]`；开启 `--check-references` 时引用缺少本地目标、目标重复、`reference` 非法或形式不受支持 |
 | `TermMappingError` | 映射项字段非法，或同一源编码存在多个不同目标；开启 `--require-mappings` 时单资源或非 transaction/batch Bundle 存在未命中映射的源编码（transaction/batch 中以上情况均降级为逐项 `processing`）；`--mapping-file` 的 `maps` 条目非法、文件内或文件与请求间同源不同目标（文件相关错误不降级为逐项 `processing`） |
 | `MappingFileError` | `--mapping-file` 文件不存在、是目录、父目录不存在、无权限、读取失败、内容不是合法 JSON 对象、`maps` 缺失或 `maps` 不是数组；stdout 为空、退出码 `2`、不写审计（开启 `--audit-errors` 也不写拒绝记录） |
@@ -473,7 +488,7 @@ python3 test_fhir_gateway.py
 
 ## 状态
 
-已实现 `fhir-gateway`：资源校验、术语映射、审计留痕端到端可用，支持单资源与 FHIR R4 Bundle；transaction/batch Bundle 支持批量执行语义（逐项校验与映射、transaction-response/batch-response、全有或全无/逐项独立、逐项审计）；`--audit-chain` 提供基于 SHA-256 的审计完整性链，`--verify-audit` 支持离线复核；`--check-references` 提供可选的本地引用完整性校验（片段 contained 解析、非执行 Bundle 跨 entry 唯一解析、外部引用仅校验形式）；`--audit-errors` 提供可选的拒绝审计（rejected 记录、按阶段归类、链式兼容）；`--strict-types` 提供可选的 FHIR R4 已知字段类型收紧（Patient/Observation/Condition、null 与形状拒绝、日期/枚举校验、value[x] 唯一、批量 processing、与其他开关组合）；`--require-mappings` 提供可选的源编码全命中要求（编码顺序精确命中、单资源/非执行 Bundle 未命中为 TermMappingError、transaction 全有或全无 400 与 batch 逐项 processing 200、拒绝审计 phase=mapping、与 verify/find 互斥）；`--audit-find` 提供只读审计检索（request_id/actor/decision 精确匹配、recorded_at 含边界时间窗、AND 组合、字段缺失跳过、行序保留不去重、敏感字段剔除、链式行/拒绝记录/批量摘要只读展示，缺文件为 AuditReadError、非法参数为 InputError、坏行为 AuditVerificationError，与其他开关同用不改变结果）；`--mapping-file` 提供请求外可复用映射目录（JSON 对象顶层 maps 数组、与请求 term_maps 合并、同目标去重/不同目标 TermMappingError 不覆盖、mappings 顺序与输出不变、审计不记路径与映射内容；文件不可读或结构非法为 MappingFileError、条目非法/文件内冲突为 TermMappingError，与 verify/find 互斥，transaction/batch 中文件错误不降级为逐项 processing），含 262 个端到端测试。
+已实现 `fhir-gateway`：资源校验、术语映射、审计留痕端到端可用，支持单资源与 FHIR R4 Bundle；transaction/batch Bundle 支持批量执行语义（逐项校验与映射、transaction-response/batch-response、全有或全无/逐项独立、逐项审计）；`--audit-chain` 提供基于 SHA-256 的审计完整性链，`--verify-audit` 支持离线复核；`--check-references` 提供可选的本地引用完整性校验（片段 contained 解析、非执行 Bundle 跨 entry 唯一解析、外部引用仅校验形式）；`--audit-errors` 提供可选的拒绝审计（rejected 记录、按阶段归类、链式兼容）；`--strict-types` 提供可选的 FHIR R4 已知字段类型收紧（Patient/Observation/Condition、null 与形状拒绝、日期/枚举校验、value[x] 唯一、批量 processing、与其他开关组合）；`--require-mappings` 提供可选的源编码全命中要求（编码顺序精确命中、单资源/非执行 Bundle 未命中为 TermMappingError、transaction 全有或全无 400 与 batch 逐项 processing 200、拒绝审计 phase=mapping、与 verify/find 互斥）；`--audit-find` 提供只读审计检索（request_id/actor/decision 精确匹配、recorded_at 含边界时间窗、AND 组合、字段缺失跳过、行序保留不去重、敏感字段剔除、链式行/拒绝记录/批量摘要只读展示，缺文件为 AuditReadError、非法参数为 InputError、坏行为 AuditVerificationError，与其他开关同用不改变结果）；`--mapping-file` 提供请求外可复用映射目录（JSON 对象顶层 maps 数组、与请求 term_maps 合并、同目标去重/不同目标 TermMappingError 不覆盖、mappings 顺序与输出不变、审计不记路径与映射内容；文件不可读或结构非法为 MappingFileError、条目非法/文件内冲突为 TermMappingError，与 verify/find 互斥，transaction/batch 中文件错误不降级为逐项 processing）；`--apply-mappings` 提供可选的映射结果落回（mapped coding 就地改写为目标编码、其余键值与 unmapped 不变、重复源编码逐个改写、Bundle 逐 entry.resource 处理且 Bundle 字段不变、mappings 的 source/status/target 与顺序不变、审计不记资源正文与映射目标、transaction/batch 与 verify/find 同用为 InputError），含 278 个端到端测试。
 
 ## 约定
 

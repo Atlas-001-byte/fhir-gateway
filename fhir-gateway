@@ -8,6 +8,7 @@
     fhir-gateway --audit-errors --audit-file PATH [--mapping-file PATH] < request.json
     fhir-gateway --strict-types --audit-file PATH [--mapping-file PATH] < request.json
     fhir-gateway --require-mappings --audit-file PATH [--mapping-file PATH] < request.json
+    fhir-gateway --apply-mappings --audit-file PATH [--mapping-file PATH] < request.json
     fhir-gateway --verify-audit --audit-file PATH
     fhir-gateway --audit-find --audit-file PATH [--request-id ID]
                                                  [--actor A]
@@ -46,6 +47,17 @@ status=400、error_type=TermMappingError 的拒绝记录）；transaction 任一
 未命中整批 status 400，batch 失败 entry status 400 且 issue.code=processing、
 其他 entry 继续、整批 200，顺序与重复位置不变，仍只写一条批量摘要，不记录
 编码值、映射配置或资源正文；不开启时行为完全不变。
+--apply-mappings 开启映射结果落回：仅接受单资源与 entry 只含 resource 的
+非 transaction/batch Bundle（transaction/batch 返回 InputError）。校验顺序、
+映射冲突规则与 mappings 输出（顺序及 source、status、target）完全不变；
+在此之上，对映射扫描到的每个 coding，命中 mapped 时把 system、code 就地
+改写为 target_system、target_code（其余键值保留，重复源编码逐个改写），
+unmapped 与其余内容不变，stdout 的 resource 为落回版本；Bundle 的 id、
+type、entry 顺序及 request 等字段不变，空 entry 或无 resource 不变。审计
+字段与脱敏边界不变（不记录资源正文、映射目标或 mapping-file 路径）。
+可与 --mapping-file、--strict-types、--check-references、--require-mappings、
+--audit-chain、--audit-errors 组合；与 --verify-audit 或 --audit-find 同用
+返回 InputError（不读 stdin）。不开启时行为完全不变。
 --audit-find 只读检索审计 JSON Lines，不读 stdin、不写审计、不执行其他功能。
 可按 --request-id、--actor（精确匹配）、--decision（accepted/rejected）与
 --from/--to（按 recorded_at 含边界，YYYY-MM-DDTHH:MM:SSZ）过滤，条件同时
@@ -840,6 +852,41 @@ def apply_bundle_mappings(bundle, index):
     return mappings
 
 
+def rewrite_resource_codings(node, index):
+    """--apply-mappings：把映射命中的 coding 就地改写为目标编码。
+
+    遍历与 _find_codings 相同的节点：含非空 system/code 的对象命中映射时，
+    system、code 改为 target_system、target_code，其余键值保留；重复源编码
+    逐个改写，未命中与其余内容不变。每个节点只改写一次，不回看新值。
+    """
+    if isinstance(node, dict):
+        system = node.get("system")
+        code = node.get("code")
+        if _is_nonempty_str(system) and _is_nonempty_str(code):
+            target = index.get((system, code))
+            if target is not None:
+                node["system"] = target[0]
+                node["code"] = target[1]
+        for value in node.values():
+            rewrite_resource_codings(value, index)
+    elif isinstance(node, list):
+        for item in node:
+            rewrite_resource_codings(item, index)
+
+
+def rewrite_bundle_codings(bundle, index):
+    """--apply-mappings：逐个改写 entry.resource；Bundle 与其余字段不动。
+
+    entry 顺序、request 等字段保持不变；空 entry 或无 resource 的 entry 不变。
+    """
+    entries = bundle.get("entry")
+    if not isinstance(entries, list):
+        return
+    for entry in entries:
+        if isinstance(entry, dict) and isinstance(entry.get("resource"), dict):
+            rewrite_resource_codings(entry["resource"], index)
+
+
 def _entry_resource_type(entry):
     """尽力取 entry.resource.resourceType，用于响应与审计；取不到为 None。"""
     if isinstance(entry, dict):
@@ -1393,6 +1440,7 @@ def parse_args(argv):
     audit_errors = False
     strict_types = False
     require_mappings = False
+    apply_mappings = False
     filters = {
         "request_id": None,
         "actor": None,
@@ -1452,6 +1500,9 @@ def parse_args(argv):
             i += 1
         elif arg == "--require-mappings":
             require_mappings = True
+            i += 1
+        elif arg == "--apply-mappings":
+            apply_mappings = True
             i += 1
         elif arg == "--verify-audit":
             verify = True
@@ -1562,6 +1613,12 @@ def parse_args(argv):
     if find and mapping_file is not None:
         # 检索不读请求、不执行映射，与可复用映射目录互斥。
         raise InputError("--audit-find 不能与 --mapping-file 同用")
+    if verify and apply_mappings:
+        # 校验模式只读、不读 stdin，与映射落回互斥。
+        raise InputError("--verify-audit 不能与 --apply-mappings 同用")
+    if find and apply_mappings:
+        # 检索不读请求、不改写资源，与映射落回互斥。
+        raise InputError("--audit-find 不能与 --apply-mappings 同用")
     if not find:
         # 过滤参数仅属于 --audit-find，其他入口不接受。
         used = [
@@ -1585,6 +1642,7 @@ def parse_args(argv):
         require_mappings,
         filters,
         mapping_file,
+        apply_mappings,
     )
 
 
@@ -1596,6 +1654,7 @@ def process(
     strict_types=False,
     require_mappings=False,
     mapping_file=None,
+    apply_to_resource=False,
 ):
     try:
         request = json.loads(raw_text)
@@ -1617,6 +1676,12 @@ def process(
 
     is_bundle = isinstance(resource, dict) and resource.get("resourceType") == "Bundle"
     if is_bundle and resource.get("type") in EXECUTABLE_BUNDLE_TYPES:
+        if apply_to_resource:
+            # 落回仅接受单资源与非 transaction/batch Bundle。
+            raise InputError(
+                "--apply-mappings 不接受 type 为 %s 的 Bundle"
+                % resource["type"]
+            )
         # transaction/batch：批量执行语义，entry 问题进入响应而非网关级错误。
         return process_executable_bundle(
             resource,
@@ -1660,6 +1725,14 @@ def process(
             mappings, "Bundle" if is_bundle else resource["resourceType"]
         )
 
+    if apply_to_resource:
+        # 映射落回：mappings 已按原始资源生成（source 保持原编码），此处再把
+        # 命中的 coding 就地改写为目标编码；未命中与其余内容不变。
+        if is_bundle:
+            rewrite_bundle_codings(resource, index)
+        else:
+            rewrite_resource_codings(resource, index)
+
     audit = {
         "request_id": audit_context["request_id"],
         "actor": audit_context["actor"],
@@ -1698,6 +1771,7 @@ def main(argv):
             require_mappings,
             filters,
             mapping_file,
+            apply_mappings,
         ) = parse_args(argv)
     except GatewayError as exc:
         _emit_error(exc)
@@ -1741,6 +1815,7 @@ def main(argv):
             strict_types,
             require_mappings,
             mapping_file,
+            apply_mappings,
         )
     except GatewayError as exc:
         if (

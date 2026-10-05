@@ -8,6 +8,7 @@
     fhir-gateway --audit-errors --audit-file PATH [--mapping-file PATH] < request.json
     fhir-gateway --strict-types --audit-file PATH [--mapping-file PATH] < request.json
     fhir-gateway --require-mappings --audit-file PATH [--mapping-file PATH] < request.json
+    fhir-gateway --apply-mappings --audit-file PATH [--mapping-file PATH] < request.json
     fhir-gateway --verify-audit --audit-file PATH
     fhir-gateway --audit-find --audit-file PATH [--request-id ID]
                                                  [--actor A]
@@ -55,6 +56,21 @@ status=400、error_type=TermMappingError 的拒绝记录）；transaction 任一
 --require-mappings 均与其互斥，同用返回 InputError。
 --require-mappings 属请求入口开关：与 --verify-audit、--audit-find 同用
 直接返回 InputError（不读 stdin、不写审计）。
+--apply-mappings 开启术语映射结果落回：仍按既有顺序完成结构、audit_context、
+资源、引用（--check-references）、严格类型（--strict-types）与映射冲突
+校验，成功 stdout 仍为 status、resource_type、resource、mappings、audit，
+其中 resource 为落回版本，mappings 顺序及 source、status、target 不变。
+对当前映射实际扫描的每个含非空 system/code 的 coding，status 为 mapped
+时把该对象的 system、code 就地改为 target_system、target_code，其他键值
+原样保留；重复源编码逐个改写，unmapped coding 与其余内容（含编码对象的
+其他键、display、text、未知字段）均不变。仅接受单资源与 entry 只含
+resource 的非 transaction、非 batch Bundle：transaction/batch Bundle、
+或非执行 Bundle 的 entry 出现 resource 以外的键（如 request）均返回
+InputError；空 entry 或无 resource 的 entry 原样保留。可与 --mapping-file、
+--strict-types、--check-references、--audit-chain、--audit-errors、
+--require-mappings 组合；与 --verify-audit 或 --audit-find 同用返回
+InputError（不读 stdin、不写审计、不创建文件）。审计仍先于 stdout 落盘，
+不记录资源正文、映射目标或 mapping-file 路径；不开启时行为完全不变。
 --mapping-file PATH 提供可复用映射目录：文件为 JSON 对象，顶层 maps 为
 数组，数组项沿用 system、code、target_system、target_code（均须非空字符串）。
 处理时先完成请求结构、audit_context、资源、引用（--check-references）与
@@ -480,8 +496,13 @@ def validate_resource(resource, strict=False, prefix=None):
         strict_validate_resource(resource, prefix)
 
 
-def validate_bundle(bundle, strict=False):
-    """校验 FHIR R4 Bundle：非空 id、合法 type，entry 内资源逐项校验。"""
+def validate_bundle(bundle, strict=False, write_back=False):
+    """校验 FHIR R4 Bundle：非空 id、合法 type，entry 内资源逐项校验。
+
+    --apply-mappings 开启时，含 resource 的 entry 必须只含 resource 一个键
+    （出现 request 等任何其他键即 InputError 模式冲突）；空 entry（{}）或
+    无 resource 的 entry 不校验、不落回、原样保留。
+    """
     if not isinstance(bundle, dict):
         raise FhirValidationError("resource 必须为对象")
 
@@ -505,7 +526,17 @@ def validate_bundle(bundle, strict=False):
             if not isinstance(entry, dict):
                 raise FhirValidationError("%s 必须为对象" % label)
             if "resource" not in entry:
+                if write_back:
+                    # 落回模式下空 entry / 无 resource 的 entry 原样保留。
+                    continue
                 raise FhirValidationError("%s 缺少 resource" % label)
+            if write_back and set(entry.keys()) != {"resource"}:
+                extra = sorted(key for key in entry.keys() if key != "resource")
+                raise InputError(
+                    "--apply-mappings 仅接受 entry 只含 resource 的非 transaction、"
+                    "非 batch Bundle，%s 含其他键: %s"
+                    % (label, "、".join(extra))
+                )
             # entry 内复用同一套 Patient/Observation/Condition 校验。
             validate_resource(
                 entry["resource"],
@@ -804,6 +835,51 @@ def apply_mappings(resource, index):
             }
         )
     return mappings
+
+
+def _rewrite_codings(node, index):
+    """--apply-mappings：就地改写命中的 coding，返回映射结果列表。
+
+    遍历与 _find_codings 完全一致的含非空 system/code 对象（dict 插入序、
+    数组按下标），保证 mappings 顺序与不落回时相同。命中时仅把该对象的
+    system、code 替换为 target_system、target_code，其余键值保留；未命中
+    对象及其余内容不动。嵌套结构就地修改，重复编码逐个改写。
+    """
+    mappings = []
+    if isinstance(node, dict):
+        system = node.get("system")
+        code = node.get("code")
+        if _is_nonempty_str(system) and _is_nonempty_str(code):
+            target = index.get((system, code))
+            if target is None:
+                mappings.append(
+                    {
+                        "source": {"system": system, "code": code},
+                        "status": "unmapped",
+                        "target": None,
+                    }
+                )
+            else:
+                node["system"] = target[0]
+                node["code"] = target[1]
+                mappings.append(
+                    {
+                        "source": {"system": system, "code": code},
+                        "status": "mapped",
+                        "target": {"system": target[0], "code": target[1]},
+                    }
+                )
+        for value in node.values():
+            _collect_rewrite(value, index, mappings)
+    elif isinstance(node, list):
+        for item in node:
+            _collect_rewrite(item, index, mappings)
+    return mappings
+
+
+def _collect_rewrite(node, index, out):
+    """_rewrite_codings 的递归续体：改写并把映射结果追加到 out。"""
+    out.extend(_rewrite_codings(node, index))
 
 
 def _first_unmapped(mappings):
@@ -1393,6 +1469,7 @@ def parse_args(argv):
     audit_errors = False
     strict_types = False
     require_mappings = False
+    apply_mappings = False
     filters = {
         "request_id": None,
         "actor": None,
@@ -1452,6 +1529,9 @@ def parse_args(argv):
             i += 1
         elif arg == "--require-mappings":
             require_mappings = True
+            i += 1
+        elif arg == "--apply-mappings":
+            apply_mappings = True
             i += 1
         elif arg == "--verify-audit":
             verify = True
@@ -1550,12 +1630,18 @@ def parse_args(argv):
     if verify and require_mappings:
         # 校验模式只读、不读 stdin，与请求入口的映射强校验互斥。
         raise InputError("--verify-audit 不能与 --require-mappings 同用")
+    if verify and apply_mappings:
+        # 校验模式只读、不读 stdin，与请求入口的映射落回互斥。
+        raise InputError("--verify-audit 不能与 --apply-mappings 同用")
     if find and verify:
         # 检索与离线校验为两个独立只读入口，不可同用。
         raise InputError("--audit-find 不能与 --verify-audit 同用")
     if find and require_mappings:
         # 检索不读请求、不执行映射，与映射强校验互斥。
         raise InputError("--audit-find 不能与 --require-mappings 同用")
+    if find and apply_mappings:
+        # 检索不读请求、不执行映射，与映射落回互斥。
+        raise InputError("--audit-find 不能与 --apply-mappings 同用")
     if verify and mapping_file is not None:
         # 离线校验只读审计文件，不读 stdin、不读取映射文件，二者互斥。
         raise InputError("--verify-audit 不能与 --mapping-file 同用")
@@ -1585,6 +1671,7 @@ def parse_args(argv):
         require_mappings,
         filters,
         mapping_file,
+        apply_mappings,
     )
 
 
@@ -1596,6 +1683,7 @@ def process(
     strict_types=False,
     require_mappings=False,
     mapping_file=None,
+    write_back=False,
 ):
     try:
         request = json.loads(raw_text)
@@ -1617,6 +1705,11 @@ def process(
 
     is_bundle = isinstance(resource, dict) and resource.get("resourceType") == "Bundle"
     if is_bundle and resource.get("type") in EXECUTABLE_BUNDLE_TYPES:
+        if write_back:
+            # 落回仅接受单资源与非 transaction、非 batch Bundle。
+            raise InputError(
+                "--apply-mappings 不支持 transaction/batch Bundle"
+            )
         # transaction/batch：批量执行语义，entry 问题进入响应而非网关级错误。
         return process_executable_bundle(
             resource,
@@ -1630,7 +1723,7 @@ def process(
         )
     if is_bundle:
         # 顺序：Bundle 自身 → 各 entry.resource（均在 term_maps 校验之前）。
-        validate_bundle(resource, strict=strict_types)
+        validate_bundle(resource, strict=strict_types, write_back=write_back)
         if check_references:
             # 非 transaction/batch Bundle：引用校验同样位于 term_maps 之前，
             # 失败时为 FhirValidationError，不写审计。
@@ -1648,11 +1741,22 @@ def process(
     )
     request_index = build_term_index(term_maps)
     index = merge_term_indexes(file_index, request_index)
-    mappings = (
-        apply_bundle_mappings(resource, index)
-        if is_bundle
-        else apply_mappings(resource, index)
-    )
+    if write_back:
+        # 落回模式：扫描与映射结果生成和基线完全一致，命中的 coding 就地
+        # 改写；空 entry / 无 resource 的 entry 跳过，原样保留。
+        mappings = []
+        if is_bundle:
+            for entry in resource.get("entry") or []:
+                if isinstance(entry, dict) and "resource" in entry:
+                    mappings.extend(_rewrite_codings(entry["resource"], index))
+        else:
+            mappings = _rewrite_codings(resource, index)
+    else:
+        mappings = (
+            apply_bundle_mappings(resource, index)
+            if is_bundle
+            else apply_mappings(resource, index)
+        )
     if require_mappings:
         # 结构、audit_context、资源、引用与严格类型校验全部通过，且 term_maps
         # 自身合法、无同源冲突后，再按编码收集顺序要求源编码精确命中。
@@ -1698,6 +1802,7 @@ def main(argv):
             require_mappings,
             filters,
             mapping_file,
+            apply_mappings,
         ) = parse_args(argv)
     except GatewayError as exc:
         _emit_error(exc)
@@ -1741,6 +1846,7 @@ def main(argv):
             strict_types,
             require_mappings,
             mapping_file,
+            write_back=apply_mappings,
         )
     except GatewayError as exc:
         if (
